@@ -1,0 +1,12 @@
+services:
+  health-mcp:
+    build: .
+    env_file: .env
+    environment:
+      HEALTH_DATA_DIR: /data
+    volumes:
+      - ./data:/data
+    # 只绑宿主机回环，公网入口交给 Caddy/Nginx/Tunnel
+    ports:
+      - "127.0.0.1:${HEALTH_MCP_PORT}:${HEALTH_MCP_PORT}"
+    restart: unless-stopped
