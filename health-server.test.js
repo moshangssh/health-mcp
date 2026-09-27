@@ -1,4 +1,4 @@
-const { test } = require("node:test");
+const { test, mock } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -6,7 +6,7 @@ const path = require("node:path");
 const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
 const { InMemoryTransport } = require("@modelcontextprotocol/sdk/inMemory.js");
 
-const { buildSummaryText, createApp, createHealthMcpServer, cycleContextForDate, mergeHealthData, normalizeSleepSession, readHealthRecords, storeCycleConfig } = require("./health-server");
+const { buildSummaryText, createApp, createHealthMcpServer, cycleContextForDate, dailySummary, formatLocalDate, mergeHealthData, normalizeSleepSession, readHealthRecords, readHealthToolResult, storeCycleConfig } = require("./health-server");
 
 function tmpDataDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "health-mcp-test-"));
@@ -14,6 +14,15 @@ function tmpDataDir() {
 
 function readDay(dir, date) {
   return JSON.parse(fs.readFileSync(path.join(dir, `${date}.json`), "utf8"));
+}
+
+// The read path resolves "today" from the wall clock, and these two flows use fixtures pinned to
+// 2026-09-06. Freezing Date there keeps the suite independent of the day it runs on.
+const FROZEN_NOW = new Date("2026-09-06T04:00:00Z");
+
+function freezeClock(t) {
+  mock.timers.enable({ apis: ["Date"], now: FROZEN_NOW });
+  t.after(() => mock.timers.reset());
 }
 
 // A night starting 23:00 the previous evening and ending at `endHour` on 2026-09-02 (Shanghai),
@@ -75,7 +84,8 @@ test("a file left duplicated by the old merge heals on the next upload", () => {
   assert.equal(record.sleep.duration_min, 480);
 });
 
-test("MCP exposes the public health read contract and custom day ranges", async () => {
+test("MCP exposes the public health read contract and custom day ranges", async (t) => {
+  freezeClock(t);
   const dir = tmpDataDir();
   for (const [date, total] of [["2026-09-02", 2000], ["2026-09-03", 3000], ["2026-09-04", 4000], ["2026-09-05", 5000], ["2026-09-06", 6000]]) {
     mergeHealthData(dir, { date, type: "steps", data: { total } });
@@ -105,7 +115,8 @@ test("MCP exposes the public health read contract and custom day ranges", async 
   await server.close();
 });
 
-test("cycle endpoint stores and clears independent cycle context", async () => {
+test("cycle endpoint stores and clears independent cycle context", async (t) => {
+  freezeClock(t);
   const dir = tmpDataDir();
   const app = createApp({ dataDir: dir, ingestToken: "1234567890abcdef" });
   const listener = app.listen(0, "127.0.0.1");
@@ -146,6 +157,75 @@ test("cycle annotations are dynamic and never written into day files", () => {
   assert.deepEqual(records[0].cycle, { period_day: 5, confirmed: true });
   assert.match(buildSummaryText(records), /经期第5天/);
   assert.equal(readDay(dir, "2026-09-05").cycle, undefined);
+});
+
+test("extra readings merge by timestamp and feed the daily summary", () => {
+  const dir = tmpDataDir();
+  const date = "2026-09-02";
+  mergeHealthData(dir, {
+    date,
+    spo2: [
+      { timestamp: `${date}T08:00:00+08:00`, value: 96 },
+      { timestamp: `${date}T09:00:00+08:00`, value: 98 },
+    ],
+    stress: [{ timestamp: `${date}T08:00:00+08:00`, value: 40, level: 2 }],
+    hrv: [{ timestamp: `${date}T08:00:00+08:00`, value: 42 }],
+    temperature: [{ timestamp: `${date}T08:00:00+08:00`, value: 36.5 }],
+    resting_heart_rate: [{ timestamp: `${date}T08:00:00+08:00`, value: 55 }],
+    steps: { total: 8000 },
+    active_calories: { total: 320 },
+    distance: { total: 4200 },
+    sleep_stats: [{ timestamp: `${date}T07:00:00+08:00`, sleep_score: 88 }],
+    emotions: [{ timestamp: `${date}T10:00:00+08:00`, status: 2 }],
+    sleep_apnea: [{ timestamp: `${date}T03:00:00+08:00`, level: 1 }],
+  });
+  // A re-sent window corrects the reading in place, and a corrected (smaller) total replaces the
+  // stored one instead of being pinned by Math.max.
+  mergeHealthData(dir, {
+    date,
+    spo2: [{ timestamp: `${date}T08:00:00+08:00`, value: 97 }],
+    steps: { total: 3000 },
+    active_calories: { total: 300 },
+    distance: { total: 4000 },
+  });
+
+  const record = readDay(dir, date);
+  assert.equal(record.spo2.samples.length, 2, "the same timestamp must overwrite, not append");
+  assert.equal(record.spo2.samples[0].value, 97);
+  assert.equal(record.active_calories.total, 300, "a corrected total replaces the larger one");
+  assert.equal(record.steps.total, 3000, "steps follow the same replace-on-correction rule");
+  assert.equal(record.distance.total, 4000);
+  assert.equal(record.sleep_stats.length, 1, "a night is stored once");
+  assert.equal(record.sleep_stats[0].sleep_score, 88);
+
+  const summary = dailySummary(record);
+  assert.equal(summary.spo2_avg, 97.5);
+  assert.equal(summary.stress_avg, 40);
+  assert.equal(summary.hrv_avg, 42);
+  assert.equal(summary.temperature_avg, 36.5);
+  assert.equal(summary.resting_hr, 55);
+  assert.equal(summary.distance_m, 4000);
+  assert.equal(summary.sleep_score, 88);
+});
+
+test("current status surfaces the latest extra reading", () => {
+  const dir = tmpDataDir();
+  const today = formatLocalDate(new Date());
+  mergeHealthData(dir, {
+    date: today,
+    spo2: [{ timestamp: `${today}T08:00:00+08:00`, value: 96 }, { timestamp: `${today}T09:00:00+08:00`, value: 97 }],
+    stress: [{ timestamp: `${today}T08:00:00+08:00`, value: 40 }],
+    hrv: [{ timestamp: `${today}T08:00:00+08:00`, value: 42 }],
+    temperature: [{ timestamp: `${today}T08:00:00+08:00`, value: 36.5 }],
+    sleep_stats: [{ timestamp: `${today}T07:00:00+08:00`, sleep_score: 88 }],
+  });
+
+  const status = readHealthToolResult(dir, { data_type: "current_status" });
+  assert.equal(status.spo2, 97, "the newest reading wins");
+  assert.equal(status.stress, 40);
+  assert.equal(status.hrv, 42);
+  assert.equal(status.temperature, 36.5);
+  assert.equal(status.sleep_score, 88);
 });
 
 test("invalid calendar dates are rejected and repeated clear stays successful", () => {

@@ -1,6 +1,6 @@
 # health-mcp · 自托管健康数据服务端
 
-把手环的步数、心率、睡眠落到你自己的服务器，并通过 MCP 暴露给 AI 助手读取。
+把手环的步数、心率、睡眠、血氧、压力、HRV、体温等健康数据落到你自己的服务器，并通过 MCP 暴露给 AI 助手读取。
 
 配合手机端的 Gadgetbridge fork 使用：
 
@@ -32,7 +32,7 @@ openssl rand -hex 24   # → HEALTH_MCP_ACCESS_TOKEN（读取）
 | `HEALTH_INGEST_TOKEN` | 上传门锁，手机 App 用，至少 16 字符，服务端强制 |
 | `HEALTH_MCP_ACCESS_TOKEN` | 读取门锁，AI 客户端用；**留空则任何人可读** |
 | `HEALTH_DATA_DIR` | 数据落盘目录，默认 `/var/lib/health-mcp` |
-| `HEALTH_MCP_PUBLIC_URLS` | 对外域名，用于 Host 头校验，多个逗号分隔 |
+| `HEALTH_MCP_PUBLIC_URLS` | 可选。对外域名白名单，多个逗号分隔；留空则不校验 Host |
 | `HEALTH_MCP_PORT` | 监听端口，默认 `3100` |
 | `HEALTH_MCP_HOST` | 监听地址，默认 `127.0.0.1`（只回环，公网由反代 / Tunnel 转入）|
 | `HEALTH_TZ` | 睡眠按「醒来日期」归属时用的时区，默认 `Asia/Shanghai` |
@@ -60,8 +60,9 @@ curl http://127.0.0.1:3100/healthz   # 返回 {"ok":true,...}
 - `days`：除 `current_status` 外可自定义读取 1～62 天；传入后优先于 `time_range`
 - `heart_rate_detail`：仅用于 `heart_rate`，可选 `daily` 或 `hourly`；小时模式只返回每小时统计，不返回原始样本
 
-不传参数时返回紧凑的当前状态。`daily_summary` 每天包含步数、卡路里、心率、血氧、压力和睡眠摘要；
-`all` 还会附带睡眠明细。读取结果可能附带 `cycle` 经期上下文。
+不传参数时返回紧凑的当前状态。`daily_summary` 每天包含步数、卡路里、距离、心率、静息心率、血氧、
+压力、HRV、体温、睡眠分数和睡眠摘要；`current_status` 额外给出各指标当天最新一次读数，`all` 还会
+附带睡眠明细。读取结果可能附带 `cycle` 经期上下文。
 
 经期配置使用上传门锁调用 `POST /cycle`，请求体包含 `enabled`、`last_start`、
 `cycle_length_days`、`cycle_period_days`，以及可选的 `last_confirmed`。关闭时发送 `{ "enabled": false }`，
@@ -71,7 +72,7 @@ MCP 入口 `https://你的域名/mcp`（Streamable HTTP）。若设了读取 tok
 
 ## 数据
 
-按天落盘为 `<HEALTH_DATA_DIR>/YYYY-MM-DD.json`。同一天重复上传自动合并：步数取较大值、心率按时间戳去重、睡眠 session 按「结束时间 + 时长」做稳定键去重。所以重复上传或手动补传历史都不会把数据搞乱。
+按天落盘为 `<HEALTH_DATA_DIR>/YYYY-MM-DD.json`。同一天重复上传自动合并：步数、卡路里、距离取较大值；心率、血氧、压力、HRV、体温、静息心率按时间戳去重（同一时间戳传新值即替换）；睡眠 session 按时间跨度重叠判断同一晚并保留更完整版本；睡眠统计、情绪、睡眠呼吸暂停按时间戳整条替换。所以重复上传或手动补传历史都不会把数据搞乱。
 
 ## 许可
 

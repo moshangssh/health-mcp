@@ -224,6 +224,73 @@ function mergeSleepSessionsForDate(dataDir, date, incoming, updatedAt) {
   return record;
 }
 
+function round1(value) {
+  return Math.round(value * 10) / 10;
+}
+
+// SpO2, stress, HRV, skin temperature and resting heart rate all arrive as timestamped readings
+// and are stored the same way: dedup on the ISO timestamp, so a re-sent window overwrites instead
+// of appending. `extraFields` keeps the per-reading detail (stress level) alongside the value.
+function mergeSeries(record, key, entries, updatedAt, extraFields = []) {
+  if (!record[key] || !Array.isArray(record[key].samples)) {
+    record[key] = { samples: [] };
+  }
+  const samples = record[key].samples;
+  for (const entry of entries) {
+    const ts = entry.timestamp || entry.ts || entry.time;
+    const value = Number(entry.value);
+    if (!ts || !Number.isFinite(value)) continue;
+    let sample = samples.find((existing) => existing.ts === ts);
+    if (!sample) {
+      sample = { ts, value };
+      samples.push(sample);
+    } else {
+      sample.value = value;
+    }
+    for (const field of extraFields) {
+      if (entry[field] !== undefined) sample[field] = entry[field];
+    }
+  }
+  samples.sort((a, b) => a.ts.localeCompare(b.ts));
+  const values = samples.map((sample) => sample.value).filter(Number.isFinite);
+  record[key].avg = values.length ? round1(values.reduce((sum, value) => sum + value, 0) / values.length) : undefined;
+  record[key].updatedAt = updatedAt;
+}
+
+// Whole-object entries keyed on their timestamp: one sleep report per night, one emotion or sleep
+// apnea reading per slot. A re-send replaces that slot instead of growing the list.
+function mergeDatedList(record, key, entries) {
+  if (!Array.isArray(record[key])) record[key] = [];
+  for (const entry of entries) {
+    const ts = entry.timestamp;
+    if (!ts) continue;
+    const index = record[key].findIndex((existing) => existing.timestamp === ts);
+    if (index === -1) {
+      record[key].push(entry);
+    } else {
+      record[key][index] = entry;
+    }
+  }
+  record[key].sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+}
+
+// A later upload is the day's authoritative snapshot: a corrected (smaller) total replaces the
+// stored one, so a bad reading washes out instead of being pinned forever by Math.max.
+function mergeTotal(record, key, incoming, updatedAt) {
+  record[key] = { total: incoming, updatedAt };
+}
+
+function latestSeriesValue(record, key) {
+  const samples = record?.[key]?.samples;
+  if (!Array.isArray(samples) || !samples.length) return null;
+  return nullableNumber(samples[samples.length - 1].value);
+}
+
+function latestSleepStats(record) {
+  const stats = record?.sleep_stats;
+  return Array.isArray(stats) && stats.length ? stats[stats.length - 1] : null;
+}
+
 function mergeHealthData(dataDir, body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("body must be an object");
   const date = body.date || formatLocalDate(new Date());
@@ -267,7 +334,7 @@ function mergeHealthData(dataDir, body) {
       const value = type === "steps" ? data : (body.steps || {});
       newTotal = Number(value.total || value.count || value.value || 0);
     }
-    current.steps = { total: Math.max(current.steps?.total || 0, newTotal), updatedAt: now };
+    current.steps = { total: newTotal, updatedAt: now };
   }
 
   if (type === "heart_rate" || body.heart_rate !== undefined) {
@@ -297,14 +364,30 @@ function mergeHealthData(dataDir, body) {
     if (body[caloriesType] !== undefined) {
       const total = Array.isArray(body[caloriesType])
         ? body[caloriesType].reduce((sum, entry) => sum + Number(entry.calories || 0), 0)
-        : 0;
-      current[caloriesType] = { total, updatedAt: now };
+        : Number(body[caloriesType].total || body[caloriesType].count || body[caloriesType].value || 0);
+      mergeTotal(current, caloriesType, total, now);
     }
+  }
+  if (body.distance !== undefined) {
+    mergeTotal(current, "distance", Number(body.distance.total || 0), now);
   }
   if (type === "calories" || type === "active_calories") {
     if (!current.active_calories) current.active_calories = { total: 0, updatedAt: now };
     current.active_calories.total += Number(data.calories || data.total || 0);
     current.active_calories.updatedAt = now;
+  }
+
+  for (const [key, extraFields] of [
+    ["spo2", []],
+    ["stress", ["level"]],
+    ["hrv", []],
+    ["temperature", []],
+    ["resting_heart_rate", []],
+  ]) {
+    if (Array.isArray(body[key])) mergeSeries(current, key, body[key], now, extraFields);
+  }
+  for (const key of ["sleep_stats", "emotions", "sleep_apnea"]) {
+    if (Array.isArray(body[key])) mergeDatedList(current, key, body[key]);
   }
 
   if (type === "sleep" || (body.sleep !== undefined && !Array.isArray(body.sleep))) {
@@ -379,9 +462,14 @@ function dailySummary(record) {
     date: record.date,
     steps: nullableNumber(record?.steps?.total),
     calories: nullableNumber(record?.active_calories?.total ?? record?.total_calories?.total),
+    distance_m: nullableNumber(record?.distance?.total),
     ...heartRateSummary(record),
-    stress_avg: nullableNumber(record?.stress?.avg ?? record?.stress),
-    spo2_avg: nullableNumber(record?.spo2?.avg ?? record?.spo2 ?? record?.blood_oxygen),
+    resting_hr: nullableNumber(record?.resting_heart_rate?.avg) ?? nullableNumber(record?.heart_rate?.resting),
+    stress_avg: nullableNumber(record?.stress?.avg),
+    spo2_avg: nullableNumber(record?.spo2?.avg),
+    hrv_avg: nullableNumber(record?.hrv?.avg),
+    temperature_avg: nullableNumber(record?.temperature?.avg),
+    sleep_score: nullableNumber(latestSleepStats(record)?.sleep_score),
     sleep: record.sleep ? {
       duration_min: nullableNumber(record.sleep.duration_min), deep_min: nullableNumber(record.sleep.deep_min),
       light_min: nullableNumber(record.sleep.light_min), rem_min: nullableNumber(record.sleep.rem_min),
@@ -441,7 +529,7 @@ function readHealthToolResult(dataDir, args = {}) {
   const sleep = sleepSessions(records);
   const resultBase = { success: true, data_type: dataType };
   const withCycle = (result) => todayRecord.cycle ? { ...result, cycle: todayRecord.cycle } : result;
-  if (dataType === "current_status") return withCycle({ ...resultBase, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, heart_rate: latestSample(todayRecord), spo2: nullableNumber(todayRecord.spo2 ?? todayRecord.blood_oxygen), stress: nullableNumber(todayRecord.stress), latest_sleep: sleep[0] || null });
+  if (dataType === "current_status") return withCycle({ ...resultBase, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, heart_rate: latestSample(todayRecord), spo2: latestSeriesValue(todayRecord, "spo2"), stress: latestSeriesValue(todayRecord, "stress"), hrv: latestSeriesValue(todayRecord, "hrv"), temperature: latestSeriesValue(todayRecord, "temperature"), sleep_score: nullableNumber(latestSleepStats(todayRecord)?.sleep_score), latest_sleep: sleep[0] || null });
   const range = { ...resultBase, time_range: timeRange, days };
   if (dataType === "steps") return withCycle({ ...range, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, summaries: summaries.map(({ date, steps, calories }) => ({ date, steps, calories })) });
   if (dataType === "heart_rate") {
@@ -450,7 +538,7 @@ function readHealthToolResult(dataDir, args = {}) {
   }
   if (dataType === "sleep") return withCycle({ ...range, recent_sleep_list: sleep });
   if (dataType === "daily_summary") return withCycle({ ...range, summaries });
-  return withCycle({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, today_heart_rate: latestSample(todayRecord), spo2: nullableNumber(todayRecord.spo2 ?? todayRecord.blood_oxygen), stress: nullableNumber(todayRecord.stress), today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, recent_sleep_list: sleep, summaries });
+  return withCycle({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, today_heart_rate: latestSample(todayRecord), spo2: latestSeriesValue(todayRecord, "spo2"), stress: latestSeriesValue(todayRecord, "stress"), hrv: latestSeriesValue(todayRecord, "hrv"), temperature: latestSeriesValue(todayRecord, "temperature"), sleep_score: nullableNumber(latestSleepStats(todayRecord)?.sleep_score), today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, recent_sleep_list: sleep, summaries });
 }
 
 function buildSummaryText(records) {
@@ -511,11 +599,11 @@ function createApp(options = {}) {
   const readToken = options.readToken ?? process.env.HEALTH_MCP_ACCESS_TOKEN ?? "";
   if (!ingestToken || ingestToken.length < 16) throw new Error("HEALTH_INGEST_TOKEN must be at least 16 characters");
 
-  const allowedHosts = [...new Set((publicUrls.length ? publicUrls : [""]).flatMap(buildAllowedHosts))];
   const app = express();
   installRequestObservability(app, { service: "health-mcp" });
   app.use(express.json({ limit: jsonLimit }));
-  app.use(hostHeaderValidation(allowedHosts));
+  // 配了才校验 Host；留空 = 任意 Host 放行（反代域名不用登记）
+  if (publicUrls.length) app.use(hostHeaderValidation([...new Set(publicUrls.flatMap(buildAllowedHosts))]));
   app.get(["/health", "/healthz"], (_req, res) => res.json({ ok: true, service: "health-mcp" }));
   app.get("/", (_req, res) => res.json({ service: "health-mcp" }));
   app.post("/api/health", ...bearerMiddleware(ingestToken), (req, res) => {
@@ -561,6 +649,7 @@ module.exports = {
   cycleContextForDate,
   createApp,
   createHealthMcpServer,
+  dailySummary,
   formatLocalDate,
   mergeHealthData,
   normalizeSleepSession,
