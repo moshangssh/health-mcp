@@ -9,8 +9,8 @@ const { z } = require("zod");
 const { buildAllowedHosts, installRequestObservability, mountMcpEndpoint } = require("./shared/http-runtime");
 
 const DEFAULT_DATA_DIR = "/var/lib/health-mcp";
-const VALID_TYPES = new Set(["steps", "heart_rate", "sleep", "all"]);
-const DATA_TYPES = ["current_status", "steps", "heart_rate", "sleep", "daily_summary", "all"];
+const VALID_TYPES = new Set(["steps", "heart_rate", "sleep", "workouts", "all"]);
+const DATA_TYPES = ["current_status", "steps", "heart_rate", "sleep", "workouts", "daily_summary", "series", "all"];
 const TIME_RANGES = ["three_days", "today"];
 const HEART_RATE_DETAILS = ["daily", "hourly"];
 const MAX_READ_DAYS = 62;
@@ -107,6 +107,43 @@ function cycleContextForDate(config, date) {
   if (periodDay <= cyclePeriodDays) return { period_day: periodDay, confirmed };
   const daysUntilPeriod = cycleLengthDays - offset;
   return daysUntilPeriod <= 3 ? { days_until_period: daysUntilPeriod, confirmed } : null;
+}
+
+// Same shape of problem as the cycle config: the body profile is not day-scoped, so the server
+// keeps one copy of it. It arrives inside a day body because that is the only authenticated channel
+// the app has, and is hoisted straight back out into its own file here.
+function normalizeProfile(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("profile must be an object");
+  const profile = {};
+  const heightCm = nullableNumber(raw.height_cm);
+  const weightKg = nullableNumber(raw.weight_kg);
+  const age = nullableNumber(raw.age);
+  if (heightCm !== null) profile.height_cm = heightCm;
+  if (weightKg !== null) profile.weight_kg = weightKg;
+  if (age !== null) profile.age = age;
+  if (typeof raw.gender === "string" && raw.gender) profile.gender = raw.gender;
+  if (validDate(raw.birthday)) profile.birthday = String(raw.birthday);
+  return profile;
+}
+
+function profilePath(dataDir) { return path.join(ensureDataDir(dataDir), "profile.json"); }
+
+function storeProfile(dataDir, raw) {
+  const profile = normalizeProfile(raw);
+  const filePath = profilePath(dataDir);
+  // The app repeats the profile on every day body of every run, so this would otherwise rewrite an
+  // identical file several times per sync. normalizeProfile fixes the key order, so a plain string
+  // compare tells an unchanged profile from an edited one.
+  if (JSON.stringify(readRecord(filePath, null)) === JSON.stringify(profile)) {
+    return profile;
+  }
+  writeRecordAtomic(filePath, profile);
+  return profile;
+}
+
+function readProfile(dataDir) {
+  const profile = readRecord(profilePath(dataDir), null);
+  return profile && typeof profile === "object" && !Array.isArray(profile) ? profile : null;
 }
 
 function normalizeSleepSession(rawSession) {
@@ -258,7 +295,8 @@ function mergeSeries(record, key, entries, updatedAt, extraFields = []) {
 }
 
 // Whole-object entries keyed on their timestamp: one sleep report per night, one emotion or sleep
-// apnea reading per slot. A re-send replaces that slot instead of growing the list.
+// apnea reading per slot, one workout per start time. A re-send replaces that slot instead of
+// growing the list.
 function mergeDatedList(record, key, entries) {
   if (!Array.isArray(record[key])) record[key] = [];
   for (const entry of entries) {
@@ -327,14 +365,19 @@ function mergeHealthData(dataDir, body) {
   }
 
   if (type === "steps" || body.steps !== undefined) {
-    let newTotal = 0;
     if (Array.isArray(body.steps)) {
-      for (const entry of body.steps) newTotal = Math.max(newTotal, Number(entry.count || 0));
+      // Steps arrive like heart rate: one reading per 5-minute bucket, the app always sending the
+      // day from local midnight. The day's total is therefore the sum of the buckets it holds,
+      // recomputed on every merge so a bucket re-sent with more steps corrects the total with it.
+      mergeSeries(current, "steps", body.steps, now);
+      // mergeSeries publishes a mean, and for steps that would read as a per-bucket average next to
+      // every other series' per-day one. The figure that means something here is the day's sum.
+      delete current.steps.avg;
+      current.steps.total = current.steps.samples.reduce((sum, sample) => sum + sample.value, 0);
     } else {
       const value = type === "steps" ? data : (body.steps || {});
-      newTotal = Number(value.total || value.count || value.value || 0);
+      current.steps = { total: Number(value.total || value.count || value.value || 0), updatedAt: now };
     }
-    current.steps = { total: newTotal, updatedAt: now };
   }
 
   if (type === "heart_rate" || body.heart_rate !== undefined) {
@@ -346,8 +389,13 @@ function mergeHealthData(dataDir, body) {
     for (const entry of entries) {
       const ts = entry.timestamp || entry.ts || entry.time || now;
       const bpm = Number(entry.value || entry.bpm || 0);
-      if (bpm > 0 && !current.heart_rate.samples.some((sample) => sample.ts === ts)) {
-        current.heart_rate.samples.push({ ts, bpm });
+      // A re-sent window replaces the bucket instead of being ignored: the app always sends the day
+      // from local midnight, so the still-growing last bucket arrives again with the rest of its
+      // readings in it, and the mean it carries the second time is the one worth keeping.
+      const existing = current.heart_rate.samples.find((sample) => sample.ts === ts);
+      if (bpm > 0) {
+        if (existing) existing.bpm = bpm;
+        else current.heart_rate.samples.push({ ts, bpm });
       }
       if (entry.resting || entry.resting_bpm) {
         current.heart_rate.resting = Number(entry.resting || entry.resting_bpm);
@@ -386,9 +434,11 @@ function mergeHealthData(dataDir, body) {
   ]) {
     if (Array.isArray(body[key])) mergeSeries(current, key, body[key], now, extraFields);
   }
-  for (const key of ["sleep_stats", "emotions", "sleep_apnea"]) {
+  for (const key of ["sleep_stats", "emotions", "sleep_apnea", "workouts"]) {
     if (Array.isArray(body[key])) mergeDatedList(current, key, body[key]);
   }
+
+  if (body.profile !== undefined) storeProfile(dataDir, body.profile);
 
   if (type === "sleep" || (body.sleep !== undefined && !Array.isArray(body.sleep))) {
     const value = type === "sleep" ? data : (body.sleep || {});
@@ -478,7 +528,7 @@ function dailySummary(record) {
   };
 }
 
-function formatSleepClock(value) {
+function formatLocalClock(value) {
   const date = new Date(value || "");
   if (Number.isNaN(date.getTime())) return null;
   const parts = new Intl.DateTimeFormat("en-US", { timeZone: TZ, month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(date).reduce((result, part) => { result[part.type] = part.value; return result; }, {});
@@ -489,7 +539,7 @@ function sleepSession(record, session) {
   const stageMinutes = (names) => (session.stages || []).reduce((total, stage) => String(stage.stage ?? "").toLowerCase() && names.some((name) => String(stage.stage ?? "").toLowerCase() === name || String(stage.stage ?? "").toLowerCase().includes(name)) ? total + Math.round(Number(stage.duration_seconds || 0) / 60) : total, 0);
   const deep = stageMinutes(["5", "deep"]); const light = stageMinutes(["4", "light"]); const rem = stageMinutes(["6", "rem"]); const awake = stageMinutes(["1", "3", "7", "awake", "out_of_bed"]);
   const duration = nullableNumber(session.duration_min) ?? 0;
-  const result = { type: awake > 0 && deep === 0 && light === 0 && rem === 0 ? "nap" : "sleep", start: formatSleepClock(session.start), end: formatSleepClock(session.end), total_minutes: duration, duration_text: `${Math.floor(duration / 60)}h ${duration % 60}min` };
+  const result = { type: awake > 0 && deep === 0 && light === 0 && rem === 0 ? "nap" : "sleep", start: formatLocalClock(session.start), end: formatLocalClock(session.end), total_minutes: duration, duration_text: `${Math.floor(duration / 60)}h ${duration % 60}min` };
   if (result.type === "sleep") Object.assign(result, { deep_sleep_minutes: deep || nullableNumber(record?.sleep?.deep_min) || 0, light_sleep_minutes: light || nullableNumber(record?.sleep?.light_min) || 0, rem_sleep_minutes: rem || nullableNumber(record?.sleep?.rem_min) || 0 });
   return result;
 }
@@ -499,6 +549,50 @@ function sleepSessions(records) {
     const sessions = Array.isArray(record.sleep_sessions) && record.sleep_sessions.length ? record.sleep_sessions : (record.sleep?.start || record.sleep?.end ? [record.sleep] : []);
     return sessions.map((session) => ({ session: sleepSession(record, session), end: new Date(session.end || "").getTime() }));
   }).sort((a, b) => b.end - a.end).map(({ session }) => session);
+}
+
+// One workout as the assistant reads it: the span, then whichever aggregates the watch reported.
+// The app leaves a metric out entirely when it was never measured, so an absent one stays absent
+// here instead of coming back as a zero that reads like a measured value.
+function workoutEntry(entry) {
+  const minutes = Math.round(Number(entry.duration_seconds || 0) / 60);
+  const result = {
+    type: String(entry.activity || "unknown"),
+    start: formatLocalClock(entry.timestamp),
+    duration_minutes: minutes,
+    duration_text: `${Math.floor(minutes / 60)}h ${minutes % 60}min`,
+  };
+  if (entry.name) result.name = entry.name;
+  for (const key of ["distance_m", "calories", "avg_heart_rate", "steps"]) {
+    const value = nullableNumber(entry[key]);
+    if (value > 0) result[key] = value;
+  }
+  return result;
+}
+
+function workoutEntries(records) {
+  return records
+    .flatMap((record) => (Array.isArray(record.workouts) ? record.workouts : []))
+    .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)))
+    .map(workoutEntry);
+}
+
+// Every timestamped series a day file holds, under the keys it stores them as. This is the raw
+// material an assistant needs to integrate its own curve — e.g. stress against the sleep window —
+// which the per-day aggregates elsewhere in this file have already averaged away.
+const SERIES_KEYS = ["steps", "heart_rate", "resting_heart_rate", "spo2", "stress", "hrv", "temperature"];
+
+function seriesForRecord(record) {
+  const day = { date: record.date };
+  for (const key of SERIES_KEYS) {
+    const samples = record[key]?.samples;
+    if (Array.isArray(samples) && samples.length) day[key] = samples;
+  }
+  if (Array.isArray(record.sleep_sessions) && record.sleep_sessions.length) {
+    // session_key is the storage-side dedup key, not something the watch reported.
+    day.sleep_sessions = record.sleep_sessions.map(({ session_key, ...session }) => session);
+  }
+  return day;
 }
 
 function hourlyHeartRateSummaries(records) {
@@ -528,17 +622,22 @@ function readHealthToolResult(dataDir, args = {}) {
   const todayRecord = records.find((record) => record.date === today) || {};
   const sleep = sleepSessions(records);
   const resultBase = { success: true, data_type: dataType };
-  const withCycle = (result) => todayRecord.cycle ? { ...result, cycle: todayRecord.cycle } : result;
-  if (dataType === "current_status") return withCycle({ ...resultBase, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, heart_rate: latestSample(todayRecord), spo2: latestSeriesValue(todayRecord, "spo2"), stress: latestSeriesValue(todayRecord, "stress"), hrv: latestSeriesValue(todayRecord, "hrv"), temperature: latestSeriesValue(todayRecord, "temperature"), sleep_score: nullableNumber(latestSleepStats(todayRecord)?.sleep_score), latest_sleep: sleep[0] || null });
+  // The profile describes the person, not the day, so it is attached once to every answer rather
+  // than repeated per day summary.
+  const profile = readProfile(dataDir);
+  const withContext = (result) => ({ ...result, ...(profile ? { profile } : {}), ...(todayRecord.cycle ? { cycle: todayRecord.cycle } : {}) });
+  if (dataType === "current_status") return withContext({ ...resultBase, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, heart_rate: latestSample(todayRecord), spo2: latestSeriesValue(todayRecord, "spo2"), stress: latestSeriesValue(todayRecord, "stress"), hrv: latestSeriesValue(todayRecord, "hrv"), temperature: latestSeriesValue(todayRecord, "temperature"), sleep_score: nullableNumber(latestSleepStats(todayRecord)?.sleep_score), latest_sleep: sleep[0] || null });
   const range = { ...resultBase, time_range: timeRange, days };
-  if (dataType === "steps") return withCycle({ ...range, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, summaries: summaries.map(({ date, steps, calories }) => ({ date, steps, calories })) });
+  if (dataType === "steps") return withContext({ ...range, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, summaries: summaries.map(({ date, steps, calories }) => ({ date, steps, calories })) });
   if (dataType === "heart_rate") {
-    const result = withCycle({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, daily_summaries: summaries.map(({ date, hr_max, hr_min, hr_avg, hr_resting }) => ({ date, hr_max, hr_min, hr_avg, hr_resting })) });
+    const result = withContext({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, daily_summaries: summaries.map(({ date, hr_max, hr_min, hr_avg, hr_resting }) => ({ date, hr_max, hr_min, hr_avg, hr_resting })) });
     return args.heart_rate_detail === "hourly" ? { ...result, detail: "hourly", hourly_summaries: hourlyHeartRateSummaries(records) } : result;
   }
-  if (dataType === "sleep") return withCycle({ ...range, recent_sleep_list: sleep });
-  if (dataType === "daily_summary") return withCycle({ ...range, summaries });
-  return withCycle({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, today_heart_rate: latestSample(todayRecord), spo2: latestSeriesValue(todayRecord, "spo2"), stress: latestSeriesValue(todayRecord, "stress"), hrv: latestSeriesValue(todayRecord, "hrv"), temperature: latestSeriesValue(todayRecord, "temperature"), sleep_score: nullableNumber(latestSleepStats(todayRecord)?.sleep_score), today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, recent_sleep_list: sleep, summaries });
+  if (dataType === "sleep") return withContext({ ...range, recent_sleep_list: sleep });
+  if (dataType === "workouts") return withContext({ ...range, recent_workout_list: workoutEntries(records) });
+  if (dataType === "daily_summary") return withContext({ ...range, summaries });
+  if (dataType === "series") return withContext({ ...range, series: records.map(seriesForRecord) });
+  return withContext({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, today_heart_rate: latestSample(todayRecord), spo2: latestSeriesValue(todayRecord, "spo2"), stress: latestSeriesValue(todayRecord, "stress"), hrv: latestSeriesValue(todayRecord, "hrv"), temperature: latestSeriesValue(todayRecord, "temperature"), sleep_score: nullableNumber(latestSleepStats(todayRecord)?.sleep_score), today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, recent_sleep_list: sleep, summaries });
 }
 
 function buildSummaryText(records) {
@@ -567,7 +666,7 @@ function buildSummaryText(records) {
 
 function createHealthMcpServer(dataDir) {
   const server = new McpServer({ name: "health", version: "1.1.0" });
-  server.tool("health_read", "读取健康数据：当前状态、步数、心率、睡眠、每日摘要或完整数据。", {
+  server.tool("health_read", "读取健康数据：当前状态、步数、心率、睡眠、运动记录、每日摘要、带时间戳的原始序列或完整数据。", {
     data_type: z.enum(DATA_TYPES).optional(),
     time_range: z.enum(TIME_RANGES).optional(),
     heart_rate_detail: z.enum(HEART_RATE_DETAILS).optional(),
@@ -655,5 +754,7 @@ module.exports = {
   normalizeSleepSession,
   readHealthRecords,
   readHealthToolResult,
+  readProfile,
   storeCycleConfig,
+  storeProfile,
 };

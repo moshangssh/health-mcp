@@ -6,7 +6,7 @@ const path = require("node:path");
 const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
 const { InMemoryTransport } = require("@modelcontextprotocol/sdk/inMemory.js");
 
-const { buildSummaryText, createApp, createHealthMcpServer, cycleContextForDate, dailySummary, formatLocalDate, mergeHealthData, normalizeSleepSession, readHealthRecords, readHealthToolResult, storeCycleConfig } = require("./health-server");
+const { buildSummaryText, createApp, createHealthMcpServer, cycleContextForDate, dailySummary, formatLocalDate, mergeHealthData, normalizeSleepSession, readHealthRecords, readHealthToolResult, readProfile, storeCycleConfig } = require("./health-server");
 
 function tmpDataDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "health-mcp-test-"));
@@ -35,6 +35,44 @@ function night(endHour, durationHours) {
     stages: [],
   };
 }
+
+test("the body profile rides in a day body but is stored once for the whole server", () => {
+  const dir = tmpDataDir();
+  const profile = { height_cm: 175, weight_kg: 70, age: 36, gender: "male", birthday: "1990-05-01" };
+  mergeHealthData(dir, { date: "2026-09-06", steps: { total: 1000 }, profile });
+  mergeHealthData(dir, { date: "2026-09-07", steps: { total: 2000 }, profile });
+
+  assert.deepEqual(readProfile(dir), profile);
+  assert.equal(readDay(dir, "2026-09-06").profile, undefined, "the day file stays day data");
+  assert.equal(readDay(dir, "2026-09-07").profile, undefined);
+  assert.deepEqual(readHealthToolResult(dir, { data_type: "daily_summary" }).profile, profile);
+});
+
+test("an unchanged profile is not rewritten on every day body", (t) => {
+  const dir = tmpDataDir();
+  const profile = { height_cm: 175, weight_kg: 70, age: 36, gender: "male", birthday: "1990-05-01" };
+  mergeHealthData(dir, { date: "2026-09-06", steps: { total: 1000 }, profile });
+
+  const writeFileSync = mock.method(fs, "writeFileSync");
+  t.after(() => writeFileSync.mock.restore());
+  mergeHealthData(dir, { date: "2026-09-07", steps: { total: 2000 }, profile });
+
+  const profileWrites = writeFileSync.mock.calls
+    .filter((call) => String(call.arguments[0]).endsWith("profile.json"));
+  assert.equal(profileWrites.length, 0, "the day still gets written, the profile does not");
+
+  // An edited profile does have to land.
+  mergeHealthData(dir, { date: "2026-09-08", steps: { total: 3000 }, profile: { ...profile, weight_kg: 71 } });
+  assert.equal(readProfile(dir).weight_kg, 71);
+});
+
+test("no profile uploaded means no profile in the answer", () => {
+  const dir = tmpDataDir();
+  mergeHealthData(dir, { date: "2026-09-06", steps: { total: 1000 } });
+
+  assert.equal(readProfile(dir), null);
+  assert.equal(readHealthToolResult(dir, { data_type: "daily_summary" }).profile, undefined);
+});
 
 test("a grown re-send overwrites the short night instead of doubling it", () => {
   const dir = tmpDataDir();
@@ -159,6 +197,41 @@ test("cycle annotations are dynamic and never written into day files", () => {
   assert.equal(readDay(dir, "2026-09-05").cycle, undefined);
 });
 
+test("step buckets are stored as a series and sum to the day total", () => {
+  const dir = tmpDataDir();
+  const date = "2026-09-02";
+  const at = (hour, minute) => `${date}T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00+08:00`;
+  mergeHealthData(dir, { date, steps: [
+    { timestamp: at(8, 0), value: 100 },
+    { timestamp: at(8, 5), value: 250 },
+  ] });
+  // A later upload re-sends the day from local midnight, so the still-growing last bucket arrives
+  // again with more steps in it.
+  mergeHealthData(dir, { date, steps: [
+    { timestamp: at(8, 0), value: 100 },
+    { timestamp: at(8, 5), value: 320 },
+  ] });
+
+  const record = readDay(dir, date);
+  assert.equal(record.steps.samples.length, 2, "the same bucket must overwrite, not append");
+  assert.equal(record.steps.total, 420, "the total follows the corrected bucket");
+  assert.equal(dailySummary(record).steps, 420);
+});
+
+test("a re-sent heart rate bucket replaces the half-finished mean", () => {
+  const dir = tmpDataDir();
+  const date = "2026-09-02";
+  // 08:17 upload: the bucket is still growing, so the app averaged the two readings it had.
+  mergeHealthData(dir, { date, heart_rate: [{ timestamp: `${date}T08:15:00+08:00`, bpm: 72 }] });
+  // 08:47 upload: the same bucket, now complete, comes back with the day from local midnight.
+  mergeHealthData(dir, { date, heart_rate: [{ timestamp: `${date}T08:15:00+08:00`, bpm: 110 }] });
+
+  const record = readDay(dir, date);
+  assert.equal(record.heart_rate.samples.length, 1, "the same bucket must overwrite, not append");
+  assert.equal(record.heart_rate.samples[0].bpm, 110, "the completed mean wins over the early one");
+  assert.equal(record.heart_rate.avg, 110);
+});
+
 test("extra readings merge by timestamp and feed the daily summary", () => {
   const dir = tmpDataDir();
   const date = "2026-09-02";
@@ -226,6 +299,85 @@ test("current status surfaces the latest extra reading", () => {
   assert.equal(status.hrv, 42);
   assert.equal(status.temperature, 36.5);
   assert.equal(status.sleep_score, 88);
+});
+
+test("workouts merge by start time and read back on their own", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  const date = "2026-09-06";
+  const run = {
+    timestamp: `${date}T07:30:00+08:00`,
+    activity: "running",
+    name: "Morning run",
+    end_time: `${date}T08:05:00+08:00`,
+    duration_seconds: 2100,
+    distance_m: 5200,
+    calories: 310,
+    avg_heart_rate: 148,
+    steps: 4900,
+  };
+  mergeHealthData(dir, { date, workouts: [run] });
+  // A re-send of the same workout, corrected by the watch, replaces it in place.
+  mergeHealthData(dir, { date, workouts: [{ ...run, distance_m: 5150 }] });
+
+  const record = readDay(dir, date);
+  assert.equal(record.workouts.length, 1, "the same start time must overwrite, not append");
+  assert.equal(record.workouts[0].distance_m, 5150);
+
+  const result = readHealthToolResult(dir, { data_type: "workouts", time_range: "today" });
+  assert.deepEqual(result.recent_workout_list, [{
+    type: "running",
+    name: "Morning run",
+    start: "9/6 07:30",
+    duration_minutes: 35,
+    duration_text: "0h 35min",
+    distance_m: 5150,
+    calories: 310,
+    avg_heart_rate: 148,
+    steps: 4900,
+  }]);
+});
+
+test("a workout the watch reported no numbers for reads as its span alone", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  mergeHealthData(dir, {
+    date: "2026-09-06",
+    workouts: [{
+      timestamp: "2026-09-06T18:00:00+08:00",
+      activity: "walking",
+      end_time: "2026-09-06T18:20:00+08:00",
+      duration_seconds: 1200,
+    }],
+  });
+
+  const result = readHealthToolResult(dir, { data_type: "workouts", time_range: "today" });
+  assert.deepEqual(Object.keys(result.recent_workout_list[0]).sort(), ["duration_minutes", "duration_text", "start", "type"]);
+});
+
+test("series returns the day's timestamped readings and sleep stages unaggregated", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  mergeHealthData(dir, {
+    date: "2026-09-06",
+    stress: [{ timestamp: "2026-09-06T08:00:00+08:00", value: 40, level: 2 }],
+    hrv: [{ timestamp: "2026-09-06T08:00:00+08:00", value: 42 }],
+    sleep: [{
+      session_start_time: "2026-09-05T15:30:00Z",
+      session_end_time: "2026-09-05T23:30:00Z",
+      duration_seconds: 28800,
+      stages: [{ start_time: "2026-09-05T15:30:00Z", end_time: "2026-09-05T16:00:00Z", duration_seconds: 1800, stage: "deep" }],
+    }],
+  });
+
+  const result = readHealthToolResult(dir, { data_type: "series", time_range: "today" });
+  assert.equal(result.data_type, "series");
+  const day = result.series[0];
+  assert.deepEqual(day.stress, [{ ts: "2026-09-06T08:00:00+08:00", value: 40, level: 2 }]);
+  assert.deepEqual(day.hrv, [{ ts: "2026-09-06T08:00:00+08:00", value: 42 }]);
+  assert.equal(day.heart_rate, undefined, "a series the day holds no readings for stays absent");
+  assert.deepEqual(day.sleep_sessions[0].stages, [{ stage: "deep", start: "2026-09-05T15:30:00.000Z", end: "2026-09-05T16:00:00.000Z", duration_seconds: 1800 }]);
+  assert.equal(day.sleep_sessions[0].session_key, undefined, "the storage dedup key is not part of the series");
 });
 
 test("invalid calendar dates are rejected and repeated clear stays successful", () => {
