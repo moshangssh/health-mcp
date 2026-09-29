@@ -103,6 +103,138 @@ test("two separate sessions on one day are both kept", () => {
   assert.equal(record.sleep.duration_min, 480 + 60);
 });
 
+test("a stage the watch tagged as a nap reads as a nap, not as the day's night", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  mergeHealthData(dir, {
+    date: "2026-09-06",
+    sleep: [
+      {
+        session_start_time: "2026-09-06T00:00:00+08:00",
+        session_end_time: "2026-09-06T08:00:00+08:00",
+        duration_seconds: 28800,
+        stages: [
+          { stage: "deep", start_time: "2026-09-06T00:00:00+08:00", end_time: "2026-09-06T06:00:00+08:00", duration_seconds: 21600 },
+          { stage: "light", start_time: "2026-09-06T06:00:00+08:00", end_time: "2026-09-06T08:00:00+08:00", duration_seconds: 7200 },
+        ],
+      },
+      {
+        session_start_time: "2026-09-06T11:00:00+08:00",
+        session_end_time: "2026-09-06T12:00:00+08:00",
+        duration_seconds: 3600,
+        stages: [
+          { stage: "nap", start_time: "2026-09-06T11:00:00+08:00", end_time: "2026-09-06T12:00:00+08:00", duration_seconds: 3600 },
+        ],
+      },
+    ],
+  });
+
+  const record = readDay(dir, "2026-09-06");
+  assert.equal(record.sleep.deep_min, 360);
+  assert.equal(record.sleep.nap_min, 60, "the nap is a stage of the day, not part of light sleep");
+  assert.equal(record.sleep.duration_min, 540, "both sessions still make up the day's sleep");
+
+  const sessions = readHealthToolResult(dir, { data_type: "sleep", time_range: "today" }).recent_sleep_list;
+  const nap = sessions.find((session) => session.start === "9/6 11:00");
+  assert.equal(nap.type, "nap");
+  assert.deepEqual(Object.keys(nap).sort(), ["duration_text", "end", "start", "total_minutes", "type"], "a nap carries no night's stage minutes");
+  const night = sessions.find((session) => session.start === "9/6 00:00");
+  assert.equal(night.type, "sleep");
+  assert.equal(night.deep_sleep_minutes, 360);
+});
+
+test("a session with nothing but awake stages is still inferred as a nap", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  mergeHealthData(dir, {
+    date: "2026-09-06",
+    sleep: [{
+      session_start_time: "2026-09-06T11:00:00+08:00",
+      session_end_time: "2026-09-06T11:10:00+08:00",
+      duration_seconds: 600,
+      stages: [
+        { stage: "awake", start_time: "2026-09-06T11:00:00+08:00", end_time: "2026-09-06T11:10:00+08:00", duration_seconds: 600 },
+      ],
+    }],
+  });
+
+  const sessions = readHealthToolResult(dir, { data_type: "sleep", time_range: "today" }).recent_sleep_list;
+  assert.equal(sessions[0].type, "nap", "a source that reports no nap tag is inferred from its stages");
+});
+
+test("a night reports the time it spent awake, which only its own stages know", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  mergeHealthData(dir, {
+    date: "2026-09-06",
+    sleep: [{
+      session_start_time: "2026-09-06T00:00:00+08:00",
+      session_end_time: "2026-09-06T08:20:00+08:00",
+      // What the app sends: time actually asleep, the waking excluded.
+      duration_seconds: 27600,
+      stages: [
+        { stage: "deep", start_time: "2026-09-06T00:00:00+08:00", end_time: "2026-09-06T03:00:00+08:00", duration_seconds: 10800 },
+        { stage: "awake", start_time: "2026-09-06T03:00:00+08:00", end_time: "2026-09-06T03:20:00+08:00", duration_seconds: 1200 },
+        { stage: "light", start_time: "2026-09-06T03:20:00+08:00", end_time: "2026-09-06T08:20:00+08:00", duration_seconds: 18000 },
+      ],
+    }],
+  });
+
+  const [night] = readHealthToolResult(dir, { data_type: "sleep", time_range: "today" }).recent_sleep_list;
+  assert.equal(night.awake_minutes, 20);
+  assert.equal(night.deep_sleep_minutes, 180);
+  assert.equal(night.light_sleep_minutes, 300);
+  assert.equal(night.total_minutes, 460, "the duration stays time asleep; the waking is the extra");
+  assert.equal(night.end, "9/6 08:20", "the span still covers the waking, so both figures read together");
+});
+
+test("a night with no stages reads its minutes off the day's own fields", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  mergeHealthData(dir, {
+    date: "2026-09-06",
+    type: "sleep",
+    data: { duration_min: 480, deep_min: 180, light_min: 260, rem_min: 40, awake_min: 25, start: "2026-09-06T00:00:00+08:00", end: "2026-09-06T08:25:00+08:00" },
+  });
+
+  const [night] = readHealthToolResult(dir, { data_type: "sleep", time_range: "today" }).recent_sleep_list;
+  assert.equal(night.type, "sleep");
+  assert.equal(night.awake_minutes, 25);
+  assert.equal(night.deep_sleep_minutes, 180);
+  assert.equal(night.rem_sleep_minutes, 40);
+});
+
+test("a sleep read carries the watch's own report for each night", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  const date = formatLocalDate(new Date());
+  mergeHealthData(dir, {
+    date,
+    sleep_stats: [{
+      timestamp: `${date}T07:00:00+08:00`,
+      sleep_score: 88,
+      bed_time: `${date}T22:40:00+08:00`,
+      fall_asleep_time: `${date}T23:12:00+08:00`,
+      wakeup_time: `${date}T07:00:00+08:00`,
+      rising_time: `${date}T07:05:00+08:00`,
+    }],
+  });
+  mergeHealthData(dir, {
+    date: "2026-09-05",
+    sleep_stats: [{ timestamp: "2026-09-05T07:10:00+08:00", sleep_score: 74, rising_time: "2026-09-05T07:20:00+08:00" }],
+  });
+
+  const result = readHealthToolResult(dir, { data_type: "sleep", days: 3 });
+  assert.deepEqual(
+    result.recent_sleep_stats_list.map((report) => report.timestamp),
+    [`${date}T07:00:00+08:00`, "2026-09-05T07:10:00+08:00"],
+    "the newest night comes first",
+  );
+  assert.equal(result.recent_sleep_stats_list[0].bed_time, `${date}T22:40:00+08:00`, "the times a session cannot show come with the read");
+  assert.equal(result.recent_sleep_stats_list[1].rising_time, "2026-09-05T07:20:00+08:00");
+  assert.deepEqual(result.recent_sleep_list, [], "a day the watch reported on but recorded no session for has none");
+});
+
 test("a file left duplicated by the old merge heals on the next upload", () => {
   const dir = tmpDataDir();
   // Simulate a record written by the old end|duration merge: the same night stored twice.
@@ -218,18 +350,33 @@ test("step buckets are stored as a series and sum to the day total", () => {
   assert.equal(dailySummary(record).steps, 420);
 });
 
-test("a re-sent heart rate bucket replaces the half-finished mean", () => {
+test("a re-sent heart rate reading replaces the one stored for its minute", () => {
   const dir = tmpDataDir();
   const date = "2026-09-02";
-  // 08:17 upload: the bucket is still growing, so the app averaged the two readings it had.
+  // 08:17 upload: the watch reported 72 for the minute that began at 08:15.
   mergeHealthData(dir, { date, heart_rate: [{ timestamp: `${date}T08:15:00+08:00`, bpm: 72 }] });
-  // 08:47 upload: the same bucket, now complete, comes back with the day from local midnight.
+  // 08:47 upload: that same minute comes back corrected, with the day from local midnight.
   mergeHealthData(dir, { date, heart_rate: [{ timestamp: `${date}T08:15:00+08:00`, bpm: 110 }] });
 
   const record = readDay(dir, date);
-  assert.equal(record.heart_rate.samples.length, 1, "the same bucket must overwrite, not append");
-  assert.equal(record.heart_rate.samples[0].bpm, 110, "the completed mean wins over the early one");
+  assert.equal(record.heart_rate.samples.length, 1, "the same minute must overwrite, not append");
+  assert.equal(record.heart_rate.samples[0].bpm, 110, "the corrected reading wins over the early one");
   assert.equal(record.heart_rate.avg, 110);
+});
+
+test("a full day of one-minute heart rate readings is kept whole", () => {
+  const dir = tmpDataDir();
+  const date = "2026-09-02";
+  const at = (i) => `${date}T${String(Math.floor(i / 60)).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}:00+08:00`;
+  // The watch now reports heart rate once a minute, so a day holds 1440 readings rather than 288.
+  // The app sends the day from local midnight, which bounds the array; nothing may cap it.
+  const heartRate = [];
+  for (let i = 0; i < 1440; i += 1) heartRate.push({ timestamp: at(i), bpm: 60 + (i % 40) });
+  mergeHealthData(dir, { date, heart_rate: heartRate });
+
+  const record = readDay(dir, date);
+  assert.equal(record.heart_rate.samples.length, 1440, "the whole day must survive the merge");
+  assert.equal(record.heart_rate.samples[0].ts, at(0), "the earliest reading of the day is still there");
 });
 
 test("extra readings merge by timestamp and feed the daily summary", () => {
@@ -301,6 +448,43 @@ test("current status surfaces the latest extra reading", () => {
   assert.equal(status.sleep_score, 88);
 });
 
+test("the night's report reads back whole, not just its score", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  const today = formatLocalDate(new Date());
+  // What the app sends: the watch's own field names, with everything it did not report left out.
+  mergeHealthData(dir, {
+    date: today,
+    sleep_stats: [{
+      timestamp: `${today}T07:00:00+08:00`,
+      sleep_score: 88,
+      bed_time: `${today}T22:40:00+08:00`,
+      fall_asleep_time: `${today}T23:12:00+08:00`,
+      wakeup_time: `${today}T07:00:00+08:00`,
+      rising_time: `${today}T07:05:00+08:00`,
+      sleep_efficiency: 92,
+      sleep_latency: 12,
+      deep_part: 21,
+      min_hrv_baseline: 35,
+      hrv_day_to_baseline: 7,
+      sleep_version: 2,
+    }],
+  });
+  // A day the watch sent no report for carries null, not an empty object.
+  mergeHealthData(dir, { date: "2026-09-05", steps: { total: 1000 } });
+
+  const summaries = readHealthToolResult(dir, { data_type: "daily_summary", time_range: "today" }).summaries;
+  assert.deepEqual(summaries[0].sleep_stats, readDay(dir, today).sleep_stats[0], "the report goes out as it was sent");
+  assert.equal(summaries[0].sleep_stats.fall_asleep_time, `${today}T23:12:00+08:00`);
+  assert.equal(summaries[0].sleep_stats.min_hrv_baseline, 35);
+  assert.equal(summaries[0].sleep_stats.sleep_version, 2);
+  assert.equal(summaries[0].sleep_score, 88, "the single-figure field stays for its existing readers");
+  assert.equal(dailySummary(readDay(dir, "2026-09-05")).sleep_stats, null);
+
+  const status = readHealthToolResult(dir, { data_type: "current_status" });
+  assert.deepEqual(status.sleep_stats, readDay(dir, today).sleep_stats[0]);
+});
+
 test("workouts merge by start time and read back on their own", (t) => {
   freezeClock(t);
   const dir = tmpDataDir();
@@ -329,6 +513,7 @@ test("workouts merge by start time and read back on their own", (t) => {
     type: "running",
     name: "Morning run",
     start: "9/6 07:30",
+    end: "9/6 08:05",
     duration_minutes: 35,
     duration_text: "0h 35min",
     distance_m: 5150,
@@ -336,6 +521,49 @@ test("workouts merge by start time and read back on their own", (t) => {
     avg_heart_rate: 148,
     steps: 4900,
   }]);
+});
+
+test("a workout reads back with its zones and the watch's own figures", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  mergeHealthData(dir, {
+    date: "2026-09-06",
+    workouts: [{
+      timestamp: "2026-09-06T07:30:00+08:00",
+      activity: "indoor_walking",
+      end_time: "2026-09-06T08:05:00+08:00",
+      duration_seconds: 2100,
+      max_heart_rate: 153,
+      min_heart_rate: 91,
+      workout_load: 19,
+      aerobic_training_effect: 1.3,
+      recovery_time_hours: 8,
+      hr_zone_fat_burn_seconds: 110,
+      hr_zone_aerobic_seconds: 1005,
+      hr_zone_extreme_seconds: 0,
+      avg_pace_seconds_km: 906.8,
+      avg_step_rate_spm: 74,
+      // A metric the watch never reports, on a row that somehow carries one.
+      avg_ground_contact_ms: 248,
+    }],
+  });
+
+  const [workout] = readHealthToolResult(dir, { data_type: "workouts", time_range: "today" }).recent_workout_list;
+
+  assert.equal(workout.end, "9/6 08:05");
+  assert.equal(workout.max_heart_rate, 153);
+  assert.equal(workout.min_heart_rate, 91);
+  assert.equal(workout.workout_load, 19);
+  assert.equal(workout.aerobic_training_effect, 1.3);
+  assert.equal(workout.recovery_time_hours, 8);
+  assert.equal(workout.avg_pace_seconds_km, 906.8);
+  assert.equal(workout.avg_step_rate_spm, 74);
+  // The watch split the workout across all five zones, so zero time in one of them is a reading.
+  assert.equal(workout.hr_zone_extreme_seconds, 0);
+  // A zone the watch did not split stays out of the answer.
+  assert.equal(workout.hr_zone_warm_up_seconds, undefined);
+  // And so does a metric it has no sensor for, however the row came to hold one.
+  assert.equal(workout.avg_ground_contact_ms, undefined);
 });
 
 test("a workout the watch reported no numbers for reads as its span alone", (t) => {
@@ -352,7 +580,7 @@ test("a workout the watch reported no numbers for reads as its span alone", (t) 
   });
 
   const result = readHealthToolResult(dir, { data_type: "workouts", time_range: "today" });
-  assert.deepEqual(Object.keys(result.recent_workout_list[0]).sort(), ["duration_minutes", "duration_text", "start", "type"]);
+  assert.deepEqual(Object.keys(result.recent_workout_list[0]).sort(), ["duration_minutes", "duration_text", "end", "start", "type"]);
 });
 
 test("series returns the day's timestamped readings and sleep stages unaggregated", (t) => {
@@ -362,6 +590,9 @@ test("series returns the day's timestamped readings and sleep stages unaggregate
     date: "2026-09-06",
     stress: [{ timestamp: "2026-09-06T08:00:00+08:00", value: 40, level: 2 }],
     hrv: [{ timestamp: "2026-09-06T08:00:00+08:00", value: 42 }],
+    sleep_stats: [{ timestamp: "2026-09-06T07:00:00+08:00", sleep_score: 88, bed_time: "2026-09-05T22:40:00+08:00" }],
+    emotions: [{ timestamp: "2026-09-06T10:00:00+08:00", last_timestamp: "2026-09-06T09:55:00+08:00", status: 2, valence: 3, arousal: 4 }],
+    sleep_apnea: [{ timestamp: "2026-09-06T03:00:00+08:00", last_timestamp: "2026-09-06T02:55:00+08:00", level: 1 }],
     sleep: [{
       session_start_time: "2026-09-05T15:30:00Z",
       session_end_time: "2026-09-05T23:30:00Z",
@@ -369,8 +600,9 @@ test("series returns the day's timestamped readings and sleep stages unaggregate
       stages: [{ start_time: "2026-09-05T15:30:00Z", end_time: "2026-09-05T16:00:00Z", duration_seconds: 1800, stage: "deep" }],
     }],
   });
+  mergeHealthData(dir, { date: "2026-09-05", steps: { total: 1000 } });
 
-  const result = readHealthToolResult(dir, { data_type: "series", time_range: "today" });
+  const result = readHealthToolResult(dir, { data_type: "series", days: 2 });
   assert.equal(result.data_type, "series");
   const day = result.series[0];
   assert.deepEqual(day.stress, [{ ts: "2026-09-06T08:00:00+08:00", value: 40, level: 2 }]);
@@ -378,6 +610,12 @@ test("series returns the day's timestamped readings and sleep stages unaggregate
   assert.equal(day.heart_rate, undefined, "a series the day holds no readings for stays absent");
   assert.deepEqual(day.sleep_sessions[0].stages, [{ stage: "deep", start: "2026-09-05T15:30:00.000Z", end: "2026-09-05T16:00:00.000Z", duration_seconds: 1800 }]);
   assert.equal(day.sleep_sessions[0].session_key, undefined, "the storage dedup key is not part of the series");
+  // The readings the day file keeps as whole objects travel with the series, under the watch's names.
+  assert.deepEqual(day.sleep_stats, [{ timestamp: "2026-09-06T07:00:00+08:00", sleep_score: 88, bed_time: "2026-09-05T22:40:00+08:00" }]);
+  assert.deepEqual(day.emotions[0], { timestamp: "2026-09-06T10:00:00+08:00", last_timestamp: "2026-09-06T09:55:00+08:00", status: 2, valence: 3, arousal: 4 });
+  assert.deepEqual(day.sleep_apnea[0], { timestamp: "2026-09-06T03:00:00+08:00", last_timestamp: "2026-09-06T02:55:00+08:00", level: 1 });
+  assert.equal(result.series[1].emotions, undefined, "a day the watch reported none for carries none");
+  assert.equal(result.series[1].sleep_stats, undefined);
 });
 
 test("invalid calendar dates are rejected and repeated clear stays successful", () => {

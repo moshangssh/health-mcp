@@ -187,6 +187,10 @@ function sleepStageMetricKey(stage) {
   if (name === "1" || name === "3" || name === "7" || name.includes("awake") || name.includes("out_of_bed")) {
     return "awake_min";
   }
+  // The app's fifth stage, tagged on the watch's own naps. No other bucket claims the name, so it
+  // does not matter where it sits in the chain; without it a nap's minutes would be counted in the
+  // day's sleep total but in no stage of it.
+  if (name.includes("nap")) return "nap_min";
   if (name === "4" || name.includes("light")) return "light_min";
   if (name === "5" || name.includes("deep")) return "deep_min";
   if (name === "6" || name.includes("rem")) return "rem_min";
@@ -200,6 +204,7 @@ function summarizeSleepSessions(sessions, updatedAt) {
     light_min: 0,
     rem_min: 0,
     awake_min: 0,
+    nap_min: 0,
     start: sessions[0]?.start || "",
     end: sessions[sessions.length - 1]?.end || "",
     score: 0,
@@ -366,9 +371,9 @@ function mergeHealthData(dataDir, body) {
 
   if (type === "steps" || body.steps !== undefined) {
     if (Array.isArray(body.steps)) {
-      // Steps arrive like heart rate: one reading per 5-minute bucket, the app always sending the
-      // day from local midnight. The day's total is therefore the sum of the buckets it holds,
-      // recomputed on every merge so a bucket re-sent with more steps corrects the total with it.
+      // Steps arrive as one reading per 5-minute bucket, the app always sending the day from local
+      // midnight. The day's total is therefore the sum of the buckets it holds, recomputed on every
+      // merge so a bucket re-sent with more steps corrects the total with it.
       mergeSeries(current, "steps", body.steps, now);
       // mergeSeries publishes a mean, and for steps that would read as a per-bucket average next to
       // every other series' per-day one. The figure that means something here is the day's sum.
@@ -389,9 +394,9 @@ function mergeHealthData(dataDir, body) {
     for (const entry of entries) {
       const ts = entry.timestamp || entry.ts || entry.time || now;
       const bpm = Number(entry.value || entry.bpm || 0);
-      // A re-sent window replaces the bucket instead of being ignored: the app always sends the day
-      // from local midnight, so the still-growing last bucket arrives again with the rest of its
-      // readings in it, and the mean it carries the second time is the one worth keeping.
+      // A re-sent reading replaces the one already stored for that timestamp instead of being
+      // ignored: the app always sends the day from local midnight, so a reading that changed
+      // between uploads arrives again, and the later value is the one worth keeping.
       const existing = current.heart_rate.samples.find((sample) => sample.ts === ts);
       if (bpm > 0) {
         if (existing) existing.bpm = bpm;
@@ -402,7 +407,6 @@ function mergeHealthData(dataDir, body) {
       }
     }
     current.heart_rate.samples.sort((a, b) => a.ts.localeCompare(b.ts));
-    if (current.heart_rate.samples.length > 288) current.heart_rate.samples = current.heart_rate.samples.slice(-288);
     const bpms = current.heart_rate.samples.map((sample) => sample.bpm).filter((bpm) => bpm > 0);
     if (bpms.length) current.heart_rate.avg = Math.round(bpms.reduce((sum, bpm) => sum + bpm, 0) / bpms.length);
     current.heart_rate.updatedAt = now;
@@ -520,10 +524,16 @@ function dailySummary(record) {
     hrv_avg: nullableNumber(record?.hrv?.avg),
     temperature_avg: nullableNumber(record?.temperature?.avg),
     sleep_score: nullableNumber(latestSleepStats(record)?.sleep_score),
+    // The night's report goes out whole rather than field by field: its names are the watch's own,
+    // and the app writes only what the watch reported, so passing it through shows the assistant
+    // every figure the watch sent and promises none it did not. Null, not an empty object, on a day
+    // the watch sent no report for.
+    sleep_stats: latestSleepStats(record),
     sleep: record.sleep ? {
       duration_min: nullableNumber(record.sleep.duration_min), deep_min: nullableNumber(record.sleep.deep_min),
       light_min: nullableNumber(record.sleep.light_min), rem_min: nullableNumber(record.sleep.rem_min),
-      awake_min: nullableNumber(record.sleep.awake_min), score: nullableNumber(record.sleep.score),
+      awake_min: nullableNumber(record.sleep.awake_min), nap_min: nullableNumber(record.sleep.nap_min),
+      score: nullableNumber(record.sleep.score),
     } : null,
   };
 }
@@ -536,12 +546,23 @@ function formatLocalClock(value) {
 }
 
 function sleepSession(record, session) {
-  const stageMinutes = (names) => (session.stages || []).reduce((total, stage) => String(stage.stage ?? "").toLowerCase() && names.some((name) => String(stage.stage ?? "").toLowerCase() === name || String(stage.stage ?? "").toLowerCase().includes(name)) ? total + Math.round(Number(stage.duration_seconds || 0) / 60) : total, 0);
+  const stages = Array.isArray(session.stages) ? session.stages : [];
+  const stageMinutes = (names) => stages.reduce((total, stage) => String(stage.stage ?? "").toLowerCase() && names.some((name) => String(stage.stage ?? "").toLowerCase() === name || String(stage.stage ?? "").toLowerCase().includes(name)) ? total + Math.round(Number(stage.duration_seconds || 0) / 60) : total, 0);
   const deep = stageMinutes(["5", "deep"]); const light = stageMinutes(["4", "light"]); const rem = stageMinutes(["6", "rem"]); const awake = stageMinutes(["1", "3", "7", "awake", "out_of_bed"]);
+  const nap = stageMinutes(["nap"]);
   const duration = nullableNumber(session.duration_min) ?? 0;
-  const result = { type: awake > 0 && deep === 0 && light === 0 && rem === 0 ? "nap" : "sleep", start: formatLocalClock(session.start), end: formatLocalClock(session.end), total_minutes: duration, duration_text: `${Math.floor(duration / 60)}h ${duration % 60}min` };
-  if (result.type === "sleep") Object.assign(result, { deep_sleep_minutes: deep || nullableNumber(record?.sleep?.deep_min) || 0, light_sleep_minutes: light || nullableNumber(record?.sleep?.light_min) || 0, rem_sleep_minutes: rem || nullableNumber(record?.sleep?.rem_min) || 0 });
-  return result;
+  // A session the watch tagged as a nap is one, whatever its stage mix looks like. The awake-only
+  // rule stays for sources that carry no nap tag: theirs is inferred from a session spent entirely
+  // awake. A nap reports no deep, light or rem of its own, and the day's totals must not stand in
+  // for them, or the whole night's stages would be read back as this nap's.
+  const isNap = nap > 0 || (awake > 0 && deep === 0 && light === 0 && rem === 0);
+  const result = { type: isNap ? "nap" : "sleep", start: formatLocalClock(session.start), end: formatLocalClock(session.end), total_minutes: duration, duration_text: `${Math.floor(duration / 60)}h ${duration % 60}min` };
+  if (isNap) return result;
+  // A session that carries stages is summed from them — a zero here is the watch saying it spent no
+  // time in that stage tonight, never another session's figure standing in. The awake minutes are
+  // what only a session can give: the summary has them by the day, and the day is not the night.
+  if (!stages.length) return Object.assign(result, { deep_sleep_minutes: nullableNumber(record?.sleep?.deep_min) || 0, light_sleep_minutes: nullableNumber(record?.sleep?.light_min) || 0, rem_sleep_minutes: nullableNumber(record?.sleep?.rem_min) || 0, awake_minutes: nullableNumber(record?.sleep?.awake_min) || 0 });
+  return Object.assign(result, { deep_sleep_minutes: deep, light_sleep_minutes: light, rem_sleep_minutes: rem, awake_minutes: awake });
 }
 
 function sleepSessions(records) {
@@ -551,21 +572,60 @@ function sleepSessions(records) {
   }).sort((a, b) => b.end - a.end).map(({ session }) => session);
 }
 
+// The watch's own report for each night, newest first, beside the sessions. It is the only place the
+// times a stage-only session cannot show live — the night the watch was gone to bed, the time it
+// took to fall asleep, the waking and rising times — so a sleep read carries it rather than making
+// the assistant ask for it under another data type.
+function sleepStatsList(records) {
+  return records
+    .flatMap((record) => (Array.isArray(record.sleep_stats) ? record.sleep_stats : []))
+    .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
+}
+
+// The aggregates a workout carries, under the names the app writes them: totals, heart rate and the
+// time it spent in each zone, then what the watch derived from the session. Each name says its own
+// unit, so they are passed through as they arrive.
+//
+// These are the metrics the watch that fills a workout row actually reports. The running form, swim,
+// jump rope, power and elevation entries the app's summary class also defines belong to watches with
+// sensors this one has not got, and copying them here would only promise the assistant fields that
+// never arrive.
+const WORKOUT_AGGREGATES = [
+  "distance_m", "calories", "steps", "active_seconds",
+  "avg_heart_rate", "max_heart_rate", "min_heart_rate",
+  "hr_zone_warm_up_seconds", "hr_zone_fat_burn_seconds", "hr_zone_aerobic_seconds",
+  "hr_zone_anaerobic_seconds", "hr_zone_extreme_seconds",
+  "workout_load", "aerobic_training_effect", "recovery_time_hours",
+];
+
+// Pace and step rate share one key across sports but not one unit — seconds per km on land, seconds
+// per 100 m in the water — so the app ends their name in the unit it stored. Whatever unit arrived
+// is the one that goes back out.
+const WORKOUT_UNIT_NAMED = ["avg_pace_", "max_pace_", "avg_step_rate_"];
+
 // One workout as the assistant reads it: the span, then whichever aggregates the watch reported.
 // The app leaves a metric out entirely when it was never measured, so an absent one stays absent
-// here instead of coming back as a zero that reads like a measured value.
+// here instead of coming back as a zero that reads like a measured value. The zones are the
+// exception the app does send a zero for: the watch splits every workout it has a heart rate for
+// across all five, so a zero there means it measured no time in that zone.
 function workoutEntry(entry) {
   const minutes = Math.round(Number(entry.duration_seconds || 0) / 60);
   const result = {
     type: String(entry.activity || "unknown"),
     start: formatLocalClock(entry.timestamp),
+    end: formatLocalClock(entry.end_time),
     duration_minutes: minutes,
     duration_text: `${Math.floor(minutes / 60)}h ${minutes % 60}min`,
   };
   if (entry.name) result.name = entry.name;
-  for (const key of ["distance_m", "calories", "avg_heart_rate", "steps"]) {
+  // The only value dropped here is one that is not a number at all.
+  const aggregates = [
+    ...WORKOUT_AGGREGATES,
+    ...Object.keys(entry).filter((key) => WORKOUT_UNIT_NAMED.some((prefix) => key.startsWith(prefix))),
+  ];
+  for (const key of aggregates) {
     const value = nullableNumber(entry[key]);
-    if (value > 0) result[key] = value;
+    if (value !== null) result[key] = value;
   }
   return result;
 }
@@ -582,11 +642,20 @@ function workoutEntries(records) {
 // which the per-day aggregates elsewhere in this file have already averaged away.
 const SERIES_KEYS = ["steps", "heart_rate", "resting_heart_rate", "spo2", "stress", "hrv", "temperature"];
 
+// Whole-object readings the day file keeps as plain arrays rather than samples, one entry per slot
+// the watch reported. Their field names and shapes are the watch's own — an emotion's valence and
+// arousal, an apnea reading's level, a night's sleep figures — so they come through as they were
+// sent. A series the day holds no entry for stays absent, like the ones above it.
+const DATED_LIST_KEYS = ["sleep_stats", "emotions", "sleep_apnea"];
+
 function seriesForRecord(record) {
   const day = { date: record.date };
   for (const key of SERIES_KEYS) {
     const samples = record[key]?.samples;
     if (Array.isArray(samples) && samples.length) day[key] = samples;
+  }
+  for (const key of DATED_LIST_KEYS) {
+    if (Array.isArray(record[key]) && record[key].length) day[key] = record[key];
   }
   if (Array.isArray(record.sleep_sessions) && record.sleep_sessions.length) {
     // session_key is the storage-side dedup key, not something the watch reported.
@@ -626,14 +695,14 @@ function readHealthToolResult(dataDir, args = {}) {
   // than repeated per day summary.
   const profile = readProfile(dataDir);
   const withContext = (result) => ({ ...result, ...(profile ? { profile } : {}), ...(todayRecord.cycle ? { cycle: todayRecord.cycle } : {}) });
-  if (dataType === "current_status") return withContext({ ...resultBase, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, heart_rate: latestSample(todayRecord), spo2: latestSeriesValue(todayRecord, "spo2"), stress: latestSeriesValue(todayRecord, "stress"), hrv: latestSeriesValue(todayRecord, "hrv"), temperature: latestSeriesValue(todayRecord, "temperature"), sleep_score: nullableNumber(latestSleepStats(todayRecord)?.sleep_score), latest_sleep: sleep[0] || null });
+  if (dataType === "current_status") return withContext({ ...resultBase, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, heart_rate: latestSample(todayRecord), spo2: latestSeriesValue(todayRecord, "spo2"), stress: latestSeriesValue(todayRecord, "stress"), hrv: latestSeriesValue(todayRecord, "hrv"), temperature: latestSeriesValue(todayRecord, "temperature"), sleep_score: nullableNumber(latestSleepStats(todayRecord)?.sleep_score), sleep_stats: latestSleepStats(todayRecord), latest_sleep: sleep[0] || null });
   const range = { ...resultBase, time_range: timeRange, days };
   if (dataType === "steps") return withContext({ ...range, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, summaries: summaries.map(({ date, steps, calories }) => ({ date, steps, calories })) });
   if (dataType === "heart_rate") {
     const result = withContext({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, daily_summaries: summaries.map(({ date, hr_max, hr_min, hr_avg, hr_resting }) => ({ date, hr_max, hr_min, hr_avg, hr_resting })) });
     return args.heart_rate_detail === "hourly" ? { ...result, detail: "hourly", hourly_summaries: hourlyHeartRateSummaries(records) } : result;
   }
-  if (dataType === "sleep") return withContext({ ...range, recent_sleep_list: sleep });
+  if (dataType === "sleep") return withContext({ ...range, recent_sleep_list: sleep, recent_sleep_stats_list: sleepStatsList(records) });
   if (dataType === "workouts") return withContext({ ...range, recent_workout_list: workoutEntries(records) });
   if (dataType === "daily_summary") return withContext({ ...range, summaries });
   if (dataType === "series") return withContext({ ...range, series: records.map(seriesForRecord) });
