@@ -1,0 +1,20 @@
+{
+  "initial_level": 25,
+  "min_level": 5,
+  "max_level": 100,
+  "stress_threshold": 30,
+  "stress_transition_half_width": 5,
+  "sleep_charge_per_stress_point": 0.035,
+  "rest_charge_per_stress_point": 0.004,
+  "stress_drain_per_stress_point": 0.002,
+  "low_intensity_drain_per_minute": 0.06,
+  "activity_reserve_threshold": 0.3,
+  "activity_drain_per_reserve": 1.2,
+  "max_heart_rate": 190,
+  "unworn_after_minutes": 15,
+  "workout_heart_rate_hold_seconds": 5,
+  "stress_hold_minutes": 30,
+  "high_stress_level": 60,
+  "high_stress_min_minutes": 20,
+  "curve_interval_minutes": 15
+}

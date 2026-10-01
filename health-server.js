@@ -10,19 +10,22 @@ const { buildAllowedHosts, installRequestObservability, mountMcpEndpoint } = req
 
 const DEFAULT_DATA_DIR = "/var/lib/health-mcp";
 const VALID_TYPES = new Set(["steps", "heart_rate", "sleep", "workouts", "all"]);
-const DATA_TYPES = ["current_status", "steps", "heart_rate", "sleep", "workouts", "daily_summary", "series", "all"];
+const DATA_TYPES = ["current_status", "steps", "heart_rate", "sleep", "workouts", "daily_summary", "series", "body_battery", "all"];
 const TIME_RANGES = ["three_days", "today"];
 const HEART_RATE_DETAILS = ["daily", "hourly"];
 const MAX_READ_DAYS = 62;
 const TZ = process.env.HEALTH_TZ || "Asia/Shanghai";
 
+// Built once: the body battery walk asks for the local date every quarter hour of the whole history.
+const LOCAL_DATE_FORMAT = new Intl.DateTimeFormat("en-CA", {
+  timeZone: TZ,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
 function formatLocalDate(date) {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: TZ,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(date);
+  return LOCAL_DATE_FORMAT.format(date);
 }
 
 function validDate(value) {
@@ -235,10 +238,10 @@ function sleepSessionsOverlap(a, b) {
   return a.start < b.end && b.start < a.end;
 }
 
-// The more complete version of a night: the one that ends later, tie-broken by more sleep captured.
-// A re-send only ever extends a session, so this keeps the corrected value and drops the stale one.
+// 较晚结束或捕获更多睡眠的版本更完整；同一起止、时长的补传则更新阶段和评分。
 function moreCompleteSleepSession(a, b) {
   if (a.end !== b.end) return a.end > b.end ? a : b;
+  if (a.start === b.start && a.duration_min === b.duration_min) return b;
   return Number(b.duration_min || 0) > Number(a.duration_min || 0) ? b : a;
 }
 
@@ -371,9 +374,10 @@ function mergeHealthData(dataDir, body) {
 
   if (type === "steps" || body.steps !== undefined) {
     if (Array.isArray(body.steps)) {
-      // Steps arrive as one reading per 5-minute bucket, the app always sending the day from local
-      // midnight. The day's total is therefore the sum of the buckets it holds, recomputed on every
-      // merge so a bucket re-sent with more steps corrects the total with it.
+      // 带粒度的上传是本地截至当前的整日快照；重建可移除旧粒度桶和已纠正的零步数桶。
+      if (body.steps_bucket_seconds !== undefined) {
+        current.steps = { samples: [], bucket_seconds: normalizePositiveInteger(body.steps_bucket_seconds, "steps_bucket_seconds") };
+      }
       mergeSeries(current, "steps", body.steps, now);
       // mergeSeries publishes a mean, and for steps that would read as a per-bucket average next to
       // every other series' per-day one. The figure that means something here is the day's sum.
@@ -440,6 +444,16 @@ function mergeHealthData(dataDir, body) {
   }
   for (const key of ["sleep_stats", "emotions", "sleep_apnea", "workouts"]) {
     if (Array.isArray(body[key])) mergeDatedList(current, key, body[key]);
+  }
+  if (Array.isArray(body.heart_rate_coverage)) {
+    // 原始活动历史的整日覆盖快照，不是佩戴状态或所有传感器同步完成的证明。
+    current.heart_rate_coverage = body.heart_rate_coverage.map(({ timestamp, end_time, status }) => {
+      const start = Date.parse(timestamp); const end = Date.parse(end_time);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end || !["observed", "missing"].includes(status)) {
+        throw new Error("heart_rate_coverage requires timestamp < end_time and status observed or missing");
+      }
+      return { timestamp: new Date(start).toISOString(), end_time: new Date(end).toISOString(), status };
+    }).sort((a, b) => a.timestamp.localeCompare(b.timestamp));
   }
 
   if (body.profile !== undefined) storeProfile(dataDir, body.profile);
@@ -646,10 +660,11 @@ const SERIES_KEYS = ["steps", "heart_rate", "resting_heart_rate", "spo2", "stres
 // the watch reported. Their field names and shapes are the watch's own — an emotion's valence and
 // arousal, an apnea reading's level, a night's sleep figures — so they come through as they were
 // sent. A series the day holds no entry for stays absent, like the ones above it.
-const DATED_LIST_KEYS = ["sleep_stats", "emotions", "sleep_apnea"];
+const DATED_LIST_KEYS = ["sleep_stats", "emotions", "sleep_apnea", "workouts", "heart_rate_coverage"];
 
 function seriesForRecord(record) {
   const day = { date: record.date };
+  if (record.steps?.bucket_seconds !== undefined) day.steps_bucket_seconds = record.steps.bucket_seconds;
   for (const key of SERIES_KEYS) {
     const samples = record[key]?.samples;
     if (Array.isArray(samples) && samples.length) day[key] = samples;
@@ -674,6 +689,216 @@ function hourlyHeartRateSummaries(records) {
     if (!buckets.has(hour)) buckets.set(hour, []); buckets.get(hour).push(value);
   }
   return [...buckets.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([hour, values]) => ({ hour, hr_max: Math.max(...values), hr_min: Math.min(...values), hr_avg: Math.round(values.reduce((sum, value) => sum + value, 0) / values.length), sample_count: values.length }));
+}
+
+// Body battery: a Garmin-style energy reserve walked minute by minute from the first night on record,
+// never reset. Every rate and threshold lives in body-battery.json at the project root and is read on
+// each call, so a tuned value applies to the whole history at once.
+const BODY_BATTERY_PARAMS_PATH = path.join(__dirname, "body-battery.json");
+const MINUTE_MS = 60000;
+const BODY_BATTERY_EVENTS = ["sleep", "activity", "data_gap", "high_stress"];
+
+// Only the readings the walk needs, pulled out of each day file as it is read, so a year of history
+// never sits in memory as whole records.
+function readBodyBatteryInputs(dataDir) {
+  const heartRate = []; const workoutHeartRate = new Map(); const heartRateCoverage = [];
+  const stress = []; const restingByDate = new Map(); const sleeps = [];
+  let observedMaxHeartRate = 0;
+  const files = fs.readdirSync(dataDir).filter((name) => /^\d{4}-\d{2}-\d{2}\.json$/.test(name)).sort();
+  for (const name of files) {
+    const record = readRecord(path.join(dataDir, name), null);
+    for (const sample of record.heart_rate?.samples || []) {
+      heartRate.push([Date.parse(sample.ts), sample.bpm]);
+      observedMaxHeartRate = Math.max(observedMaxHeartRate, sample.bpm);
+    }
+    for (const workout of record.workouts || []) {
+      if (Number.isFinite(workout.max_heart_rate)) observedMaxHeartRate = Math.max(observedMaxHeartRate, workout.max_heart_rate);
+      // 恢复心率仍随运动开始日存储，不能按 end_time 截断；全历史按实际时间排序。
+      for (const sample of workout.heart_rate || []) {
+        const t = Date.parse(sample.timestamp); const bpm = Number(sample.value);
+        if (Number.isFinite(t) && Number.isFinite(bpm) && bpm > 0) {
+          workoutHeartRate.set(t, bpm);
+          observedMaxHeartRate = Math.max(observedMaxHeartRate, bpm);
+        }
+      }
+    }
+    for (const interval of record.heart_rate_coverage || []) {
+      heartRateCoverage.push({ start: Date.parse(interval.timestamp), end: Date.parse(interval.end_time), status: interval.status });
+    }
+    for (const sample of record.stress?.samples || []) stress.push([Date.parse(sample.ts), sample.value]);
+    // The day's latest resting figure stands for the whole local day (Q29).
+    const resting = (record.resting_heart_rate?.samples || []).reduce((latest, sample) => (!latest || Date.parse(sample.ts) > Date.parse(latest.ts) ? sample : latest), null);
+    if (resting) restingByDate.set(record.date, resting.value);
+    for (const session of record.sleep_sessions || []) {
+      sleeps.push({
+        start: Date.parse(session.start),
+        end: Date.parse(session.end),
+        awake: session.stages.filter((stage) => sleepStageMetricKey(stage.stage) === "awake_min").map((stage) => [Date.parse(stage.start), Date.parse(stage.end)]),
+      });
+    }
+  }
+  const byTime = (a, b) => a[0] - b[0];
+  return {
+    heartRate: heartRate.sort(byTime), workoutHeartRate: [...workoutHeartRate].sort(byTime),
+    heartRateCoverage: heartRateCoverage.sort((a, b) => a.start - b.start),
+    stress: stress.sort(byTime), restingByDate, sleeps: sleeps.sort((a, b) => a.start - b.start), observedMaxHeartRate,
+  };
+}
+
+// 从第一晚入睡积分到最后一条数据，始终计算 [t, next) 的实际时长。
+// 每分钟内再按读数、有效期和睡眠阶段边界切分，状态点表示已经积分到该时刻。
+function walkBodyBattery(inputs, params) {
+  const { heartRate, workoutHeartRate = [], heartRateCoverage = [], stress, restingByDate, sleeps } = inputs;
+  const restingDates = [...restingByDate.keys()].sort();
+  const wakingDates = sleeps.map((session) => formatLocalDate(new Date(session.end)));
+  const start = sleeps[0].start;
+  const end = Math.max(heartRate.at(-1)?.[0] ?? 0, workoutHeartRate.at(-1)?.[0] ?? 0, stress.at(-1)?.[0] ?? 0,
+    ...sleeps.map((session) => session.end), heartRateCoverage.reduce((latest, interval) => Math.max(latest, interval.end), 0));
+  const curveMs = params.curve_interval_minutes * MINUTE_MS;
+  let level = params.initial_level;
+  let hrIndex = 0; let workoutIndex = 0; let coverageIndex = 0; let stressIndex = 0; let sleepIndex = 0; let restingIndex = -1;
+  let lastHr = null; let lastWorkoutHr = null; let lastStress = null; let date = null;
+  let intervalEstimated = false;
+  const estimation = { minutes: 0, charged: 0, drained: 0 };
+  const contributions = {};
+  const days = new Map(); const curve = [{ t: start, level, estimated: false, interval_estimated: false }]; const events = []; const open = {};
+  const close = (run, endMs, to) => {
+    if (run.type === "high_stress" && endMs - run.start < params.high_stress_min_minutes * MINUTE_MS) return;
+    events.push({ type: run.type, start: run.start, end: endMs, change: round1(to - run.from), ...(run.reason ? { reason: run.reason } : {}) });
+  };
+
+  for (let t = start; t < end;) {
+    while (hrIndex < heartRate.length && heartRate[hrIndex][0] <= t) lastHr = heartRate[hrIndex++];
+    while (workoutIndex < workoutHeartRate.length && workoutHeartRate[workoutIndex][0] <= t) lastWorkoutHr = workoutHeartRate[workoutIndex++];
+    while (coverageIndex < heartRateCoverage.length && heartRateCoverage[coverageIndex].end <= t) coverageIndex += 1;
+    const coverage = heartRateCoverage[coverageIndex]?.start <= t ? heartRateCoverage[coverageIndex] : null;
+    while (stressIndex < stress.length && stress[stressIndex][0] <= t) lastStress = stress[stressIndex++];
+    while (sleepIndex < sleeps.length && sleeps[sleepIndex].end <= t) sleepIndex += 1;
+    const session = sleeps[sleepIndex]?.start <= t ? sleeps[sleepIndex] : null;
+    const asleep = session !== null && !session.awake.some(([from, to]) => from <= t && t < to);
+    // 步长经过每个整分钟；时区偏移为整刻钟，当地日期也只在整刻钟边界变化。
+    if (date === null || t % (15 * MINUTE_MS) === 0) date = formatLocalDate(new Date(t));
+    while (restingIndex + 1 < restingDates.length && restingDates[restingIndex + 1] <= date) restingIndex += 1;
+
+    const workoutExpires = lastWorkoutHr === null ? t : lastWorkoutHr[0] + params.workout_heart_rate_hold_seconds * 1000;
+    const workoutFresh = t < workoutExpires;
+    // 沿用历史配置键以兼容仍在运行的旧进程；它仅表示普通心率有效期，不证明离腕。
+    const ordinaryExpires = lastHr === null ? t : lastHr[0] + params.unworn_after_minutes * MINUTE_MS;
+    // 高频点过期后只用更新的普通点。missing 可来自智能采样间隙，不缩短普通点的有效期。
+    const ordinaryFresh = lastHr !== null && t < ordinaryExpires
+      && (lastWorkoutHr === null || lastHr[0] > lastWorkoutHr[0]);
+    const selectedHr = workoutFresh ? lastWorkoutHr : ordinaryFresh ? lastHr : null;
+    const hrFresh = selectedHr !== null;
+    const hrExpires = workoutFresh ? workoutExpires : ordinaryExpires;
+    const stressExpires = lastStress === null ? t : lastStress[0] + params.stress_hold_minutes * MINUTE_MS;
+    const stressFresh = t < stressExpires;
+    // 只平滑阈值附近：区间外保持原恢复/耗损速率，不整体平移高压力区的消耗。
+    let pressureDelta = 0;
+    if (stressFresh) {
+      const score = lastStress[1];
+      const charge = (asleep ? params.sleep_charge_per_stress_point : params.rest_charge_per_stress_point) * Math.max(0, params.stress_threshold - score);
+      const weight = Math.min(1, Math.max(0, (score - params.stress_threshold + params.stress_transition_half_width) / (2 * params.stress_transition_half_width)));
+      pressureDelta = (1 - weight) * charge - weight * params.stress_drain_per_stress_point * score;
+    }
+    const stressDrain = Math.max(0, -pressureDelta);
+    let state; let delta; let gapReason = null;
+    if (!hrFresh) {
+      gapReason = coverage?.status === "missing" ? "heart_rate_missing" : "heart_rate_unavailable";
+      state = gapReason; delta = -params.low_intensity_drain_per_minute;
+    } else {
+      // 睡眠会话（含夜醒）取醒来日静息心率，清醒区间沿用当日或最近历史值。
+      const restingDate = session ? wakingDates[sleepIndex] : restingDates[restingIndex];
+      const resting = restingByDate.get(restingDate);
+      if (resting === undefined) throw new Error(`身体电量缺少 ${session ? wakingDates[sleepIndex] : date} 的静息心率数据`);
+      const reserve = (selectedHr[1] - resting) / (params.max_heart_rate - resting);
+      if (!stressFresh) gapReason = "stress_unavailable";
+      if (reserve > params.activity_reserve_threshold) {
+        const activityDrain = Math.max(params.low_intensity_drain_per_minute, params.activity_drain_per_reserve * (reserve - params.activity_reserve_threshold));
+        state = "activity"; delta = -Math.max(activityDrain, stressDrain);
+      } else if (!stressFresh) {
+        state = "stress_unavailable"; delta = -params.low_intensity_drain_per_minute;
+      } else {
+        state = pressureDelta > 0 ? (asleep ? "sleep_recovery" : "rest_recovery") : "stress";
+        delta = pressureDelta;
+      }
+    }
+
+    const flags = { sleep: session !== null, activity: state === "activity", data_gap: gapReason !== null, high_stress: stressFresh && lastStress[1] >= params.high_stress_level };
+    for (const type of BODY_BATTERY_EVENTS) {
+      const reason = type === "data_gap" ? gapReason : null;
+      if (open[type] && (!flags[type] || open[type].reason !== reason)) { close(open[type], t, level); open[type] = null; }
+      if (flags[type] && !open[type]) open[type] = { type, reason, start: t, from: level };
+    }
+
+    let next = Math.min(end, (Math.floor(t / MINUTE_MS) + 1) * MINUTE_MS, (Math.floor(t / curveMs) + 1) * curveMs);
+    if (hrIndex < heartRate.length) next = Math.min(next, heartRate[hrIndex][0]);
+    if (workoutIndex < workoutHeartRate.length) next = Math.min(next, workoutHeartRate[workoutIndex][0]);
+    if (coverage) next = Math.min(next, coverage.end);
+    else if (coverageIndex < heartRateCoverage.length) next = Math.min(next, heartRateCoverage[coverageIndex].start);
+    if (stressIndex < stress.length) next = Math.min(next, stress[stressIndex][0]);
+    if (hrFresh) next = Math.min(next, hrExpires);
+    if (stressFresh) next = Math.min(next, stressExpires);
+    if (session) {
+      next = Math.min(next, session.end);
+      for (const [from, to] of session.awake) {
+        if (from > t) next = Math.min(next, from);
+        if (to > t) next = Math.min(next, to);
+      }
+    } else if (sleepIndex < sleeps.length) next = Math.min(next, sleeps[sleepIndex].start);
+
+    const before = level; const minutes = (next - t) / MINUTE_MS;
+    level = Math.min(params.max_level, Math.max(params.min_level, level + delta * minutes));
+    const charged = Math.max(0, level - before); const drained = Math.max(0, before - level);
+    if (!days.has(date)) days.set(date, { date, max: before, min: before, charged: 0, drained: 0, estimated_minutes: 0 });
+    const day = days.get(date);
+    day.max = Math.max(day.max, level); day.min = Math.min(day.min, level);
+    day.charged += charged; day.drained += drained;
+    if (!contributions[state]) contributions[state] = { minutes: 0, charged: 0, drained: 0 };
+    contributions[state].minutes += minutes; contributions[state].charged += charged; contributions[state].drained += drained;
+    if (gapReason !== null) {
+      estimation.minutes += minutes; estimation.charged += charged; estimation.drained += drained;
+      day.estimated_minutes += minutes; intervalEstimated = true;
+    }
+    if (next % curveMs === 0 || next === end) {
+      curve.push({ t: next, level, estimated: estimation.minutes > 0, interval_estimated: intervalEstimated });
+      intervalEstimated = false;
+    }
+    t = next;
+  }
+  for (const type of BODY_BATTERY_EVENTS) if (open[type]) close(open[type], end, level);
+  return { level, start, end, estimation, contributions, days: [...days.values()], curve, events: events.sort((a, b) => a.start - b.start) };
+}
+
+function formatBodyBatteryClock(ms) {
+  const clock = formatLocalClock(ms);
+  return ms % MINUTE_MS === 0 ? clock : `${clock}:${new Date(ms).toISOString().slice(17, 23).replace(/\.000$/, "")}`;
+}
+
+function bodyBattery(dataDir, days) {
+  const params = JSON.parse(fs.readFileSync(BODY_BATTERY_PARAMS_PATH, "utf8"));
+  const inputs = readBodyBatteryInputs(dataDir);
+  // The walk starts at the first night's sleep; before one is on record there is no battery yet.
+  if (!inputs.sleeps.length) return null;
+  const walk = walkBodyBattery(inputs, params);
+  // The history is always walked whole; `days` only picks how many local days of it are shown.
+  const since = new Date();
+  since.setDate(since.getDate() - (days - 1));
+  const fromDate = formatLocalDate(since);
+  const shown = (ms) => formatLocalDate(new Date(ms)) >= fromDate;
+  const rounded = (values) => Object.fromEntries(Object.entries(values).map(([key, value]) => [key, round1(value)]));
+  return {
+    level: Math.round(walk.level),
+    as_of: formatBodyBatteryClock(walk.end),
+    initial: { time: formatBodyBatteryClock(walk.start), level: params.initial_level, source: "configured" },
+    estimated: walk.estimation.minutes > 0,
+    estimation: rounded(walk.estimation),
+    contributions: Object.fromEntries(Object.entries(walk.contributions).map(([key, values]) => [key, rounded(values)])),
+    max_heart_rate_setting: params.max_heart_rate,
+    observed_max_heart_rate: inputs.observedMaxHeartRate,
+    daily: walk.days.filter((day) => day.date >= fromDate).map((day) => ({ date: day.date, max: Math.round(day.max), min: Math.round(day.min), charged: Math.round(day.charged), drained: Math.round(day.drained), estimated_minutes: round1(day.estimated_minutes) })),
+    events: walk.events.filter((event) => shown(event.end)).map((event) => ({ type: event.type, start: formatBodyBatteryClock(event.start), end: formatBodyBatteryClock(event.end), change: event.change, ...(event.reason ? { reason: event.reason } : {}) })),
+    curve: walk.curve.filter((point) => shown(point.t)).map((point) => ({ time: formatBodyBatteryClock(point.t), level: Math.round(point.level), ...(point.estimated ? { estimated: true } : {}), ...(point.interval_estimated ? { interval_estimated: true } : {}) })),
+  };
 }
 
 function parseHealthToolRequest(args = {}) {
@@ -706,6 +931,7 @@ function readHealthToolResult(dataDir, args = {}) {
   if (dataType === "workouts") return withContext({ ...range, recent_workout_list: workoutEntries(records) });
   if (dataType === "daily_summary") return withContext({ ...range, summaries });
   if (dataType === "series") return withContext({ ...range, series: records.map(seriesForRecord) });
+  if (dataType === "body_battery") return withContext({ ...range, body_battery: bodyBattery(dataDir, days) });
   return withContext({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, today_heart_rate: latestSample(todayRecord), spo2: latestSeriesValue(todayRecord, "spo2"), stress: latestSeriesValue(todayRecord, "stress"), hrv: latestSeriesValue(todayRecord, "hrv"), temperature: latestSeriesValue(todayRecord, "temperature"), sleep_score: nullableNumber(latestSleepStats(todayRecord)?.sleep_score), today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, recent_sleep_list: sleep, summaries });
 }
 
@@ -735,7 +961,7 @@ function buildSummaryText(records) {
 
 function createHealthMcpServer(dataDir) {
   const server = new McpServer({ name: "health", version: "1.1.0" });
-  server.tool("health_read", "读取健康数据：当前状态、步数、心率、睡眠、运动记录、每日摘要、带时间戳的原始序列或完整数据。", {
+  server.tool("health_read", "读取健康数据：当前状态、步数、心率、睡眠、运动记录、每日摘要、带时间戳的原始序列、身体电量或完整数据。", {
     data_type: z.enum(DATA_TYPES).optional(),
     time_range: z.enum(TIME_RANGES).optional(),
     heart_rate_detail: z.enum(HEART_RATE_DETAILS).optional(),
@@ -807,7 +1033,14 @@ function main() {
   const port = Number(process.env.HEALTH_MCP_PORT || 3100);
   const host = process.env.HEALTH_MCP_HOST || "127.0.0.1";
   const app = createApp();
-  app.listen(port, host, () => console.log(`Health MCP listening on ${host}:${port}`));
+  // A port already taken by another instance still runs this callback — the line below is printed and
+  // the process then exits 0 with nothing on stderr, which reads as a successful start. The error
+  // event is the only place the bind failure shows up.
+  app.listen(port, host, () => console.log(`Health MCP listening on ${host}:${port}`))
+    .on("error", (error) => {
+      console.error(`Health MCP failed to start on ${host}:${port}: ${error.message}`);
+      process.exitCode = 1;
+    });
 }
 
 if (require.main === module) main();
@@ -826,4 +1059,5 @@ module.exports = {
   readProfile,
   storeCycleConfig,
   storeProfile,
+  walkBodyBattery,
 };

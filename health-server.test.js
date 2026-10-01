@@ -6,7 +6,7 @@ const path = require("node:path");
 const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
 const { InMemoryTransport } = require("@modelcontextprotocol/sdk/inMemory.js");
 
-const { buildSummaryText, createApp, createHealthMcpServer, cycleContextForDate, dailySummary, formatLocalDate, mergeHealthData, normalizeSleepSession, readHealthRecords, readHealthToolResult, readProfile, storeCycleConfig } = require("./health-server");
+const { buildSummaryText, createApp, createHealthMcpServer, cycleContextForDate, dailySummary, formatLocalDate, mergeHealthData, normalizeSleepSession, readHealthRecords, readHealthToolResult, readProfile, storeCycleConfig, walkBodyBattery } = require("./health-server");
 
 function tmpDataDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "health-mcp-test-"));
@@ -625,4 +625,451 @@ test("invalid calendar dates are rejected and repeated clear stays successful", 
   assert.deepEqual(storeCycleConfig(dir, { enabled: false }), { enabled: false });
   assert.deepEqual(storeCycleConfig(dir, { enabled: false }), { enabled: false });
   assert.equal(fs.existsSync(path.join(dir, "cycle.json")), false);
+});
+
+// Body battery: the walk runs on constructed minute series, so each rule shows on its own against the
+// shipped parameter file.
+const BB_PARAMS = JSON.parse(fs.readFileSync(path.join(__dirname, "body-battery.json"), "utf8"));
+const BB_T0 = Date.parse("2026-09-01T23:00:00+08:00");
+const at = (minute) => BB_T0 + minute * 60000;
+
+function readings(from, to, step, value) {
+  const list = [];
+  for (let minute = from; minute <= to; minute += step) list.push([at(minute), value]);
+  return list;
+}
+
+function batteryInputs({ heartRate, workoutHeartRate = [], heartRateCoverage = [], stress = [], sleeps, restingByDate = new Map([["2026-09-01", 50], ["2026-09-02", 50]]) }) {
+  return { heartRate, workoutHeartRate, heartRateCoverage, stress, restingByDate, sleeps, observedMaxHeartRate: 0 };
+}
+
+test("a calm night charges the battery, slower in its awake stages", () => {
+  // Five hours at the shipped rates, so the level stays under the ceiling and the two charge rates
+  // can be told apart.
+  const night = (awake) => batteryInputs({ heartRate: readings(0, 300, 1, 50), stress: readings(0, 300, 10, 25), sleeps: [{ start: at(0), end: at(300), awake }] });
+  const calm = walkBodyBattery(night([]), BB_PARAMS);
+  assert.ok(calm.level > BB_PARAMS.initial_level + 30, `a calm night charges well, got ${calm.level}`);
+  assert.ok(calm.events.find((event) => event.type === "sleep").change > 0);
+
+  const woke = walkBodyBattery(night([[at(120), at(240)]]), BB_PARAMS);
+  assert.ok(calm.level - woke.level > 5, "two hours awake in the night charge at the resting rate");
+});
+
+test("a stressed night drains instead of charging", () => {
+  const walk = walkBodyBattery(batteryInputs({ heartRate: readings(0, 60, 1, 50), stress: readings(0, 60, 10, 40), sleeps: [{ start: at(0), end: at(60), awake: [] }] }), BB_PARAMS);
+  assert.ok(walk.level < BB_PARAMS.initial_level);
+  assert.ok(walk.events.find((event) => event.type === "sleep").change < 0);
+});
+
+test("心率缺测按估算速率消耗，积分停在最后读数而不认定离腕", () => {
+  const walk = walkBodyBattery(batteryInputs({
+    heartRate: [...readings(0, 60, 1, 50), [at(180), 50]],
+    stress: readings(0, 60, 10, 18),
+    sleeps: [{ start: at(0), end: at(60), awake: [] }],
+  }), BB_PARAMS);
+  const gap = walk.events.find((event) => event.type === "data_gap" && event.reason === "heart_rate_unavailable");
+  assert.ok(gap);
+  assert.ok(gap.change < 0);
+  assert.ok(walk.events.every((event) => event.type !== "unworn"));
+  assert.ok(walk.curve.some((point) => point.estimated), "the gap is marked estimated on the curve");
+  assert.equal(walk.end, at(180), "no minute past the last reading is walked");
+});
+
+test("a heart rate reserve above the threshold drains as activity", () => {
+  const walk = walkBodyBattery(batteryInputs({ heartRate: readings(0, 30, 1, 140), sleeps: [{ start: at(0), end: at(1), awake: [] }] }), BB_PARAMS);
+  assert.ok(walk.events.find((event) => event.type === "activity").change < -10);
+});
+
+test("the battery stays within its bounds", () => {
+  const long = walkBodyBattery(batteryInputs({ heartRate: readings(0, 960, 1, 50), stress: readings(0, 960, 10, 15), sleeps: [{ start: at(0), end: at(960), awake: [] }] }), BB_PARAMS);
+  assert.equal(long.level, BB_PARAMS.max_level);
+  near(long.days.reduce((sum, day) => sum + day.charged - day.drained, 0), BB_PARAMS.max_level - BB_PARAMS.initial_level);
+  const hard = walkBodyBattery(batteryInputs({ heartRate: readings(0, 120, 1, 160), sleeps: [{ start: at(0), end: at(1), awake: [] }] }), BB_PARAMS);
+  assert.equal(hard.level, BB_PARAMS.min_level);
+  near(hard.days.reduce((sum, day) => sum + day.charged - day.drained, 0), BB_PARAMS.min_level - BB_PARAMS.initial_level);
+});
+
+test("body battery reads through the tool, and is absent before the first night", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  assert.equal(readHealthToolResult(dir, { data_type: "body_battery" }).body_battery, null);
+
+  const minutes = Array.from({ length: 420 }, (_, index) => new Date(Date.parse("2026-09-05T23:00:00+08:00") + index * 60000).toISOString());
+  mergeHealthData(dir, {
+    date: "2026-09-06",
+    heart_rate: minutes.map((timestamp) => ({ timestamp, value: 52 })),
+    stress: minutes.filter((_, index) => index % 10 === 0).map((timestamp) => ({ timestamp, value: 18, level: 1 })),
+    resting_heart_rate: [{ timestamp: "2026-09-06T06:00:00+08:00", value: 50 }],
+    sleep: [{ session_start_time: "2026-09-05T23:00:00+08:00", session_end_time: "2026-09-06T06:00:00+08:00", duration_seconds: 25200, stages: [] }],
+  });
+  const battery = readHealthToolResult(dir, { data_type: "body_battery", time_range: "today" }).body_battery;
+  assert.ok(battery.level > BB_PARAMS.initial_level);
+  assert.equal(battery.as_of, "9/6 06:00", "the walk ends at the latest reading, here the night's end");
+  assert.equal(battery.observed_max_heart_rate, 52);
+  assert.equal(battery.max_heart_rate_setting, BB_PARAMS.max_heart_rate);
+  assert.deepEqual(battery.daily.map((day) => day.date), ["2026-09-06"], "only the asked days are shown");
+  const history = readHealthToolResult(dir, { data_type: "body_battery", days: 3 }).body_battery;
+  assert.equal(history.level, battery.level);
+  assert.equal(history.as_of, battery.as_of);
+  assert.deepEqual(history.curve.filter((point) => point.time.startsWith("9/6 ")), battery.curve);
+});
+
+function near(actual, expected) {
+  assert.ok(Math.abs(actual - expected) < 1e-9, `实际 ${actual}，预期 ${expected}`);
+}
+
+test("跨过活动阈值不能降低压力或低强度耗电", () => {
+  for (const pressure of [null, 18, 70]) {
+    const levels = [91, 92, 93, 100, 140].map((bpm) => walkBodyBattery(batteryInputs({
+      heartRate: readings(0, 10, 1, bpm),
+      stress: pressure === null ? [] : readings(0, 10, 1, pressure),
+      sleeps: [{ start: at(0), end: at(10), awake: [] }],
+    }), BB_PARAMS).level);
+    for (let i = 1; i < levels.length; i += 1) assert.ok(levels[i] <= levels[i - 1], `压力 ${pressure}：心率增加后不能少耗电`);
+    if (pressure === 70) near(levels[2], BB_PARAMS.initial_level - 10 * BB_PARAMS.stress_drain_per_stress_point * pressure);
+    if (pressure === null) near(levels[2], BB_PARAMS.initial_level - 10 * BB_PARAMS.low_intensity_drain_per_minute);
+  }
+});
+
+test("首夜及其夜醒使用醒来日静息心率而非入睡日基线", () => {
+  const input = (restingByDate) => batteryInputs({
+    heartRate: readings(0, 90, 1, 95), stress: readings(0, 90, 10, 25),
+    sleeps: [{ start: at(0), end: at(90), awake: [[at(10), at(20)]] }], restingByDate,
+  });
+  const onlyWakingDay = walkBodyBattery(input(new Map([["2026-09-02", 50]])), BB_PARAMS);
+  const previousDayDifferent = walkBodyBattery(input(new Map([["2026-09-01", 100], ["2026-09-02", 50]])), BB_PARAMS);
+  near(onlyWakingDay.level, BB_PARAMS.initial_level - 90 * BB_PARAMS.low_intensity_drain_per_minute);
+  assert.deepEqual(previousDayDifferent, onlyWakingDay);
+});
+
+test("缺少必需的静息心率明确失败，心率缺测估算无需基线", () => {
+  const inputs = batteryInputs({
+    heartRate: readings(0, 1, 1, 140), stress: readings(0, 1, 1, 18),
+    sleeps: [{ start: at(0), end: at(1), awake: [] }], restingByDate: new Map(),
+  });
+  assert.throws(() => walkBodyBattery(inputs, BB_PARAMS), /静息心率.*2026-09-01|2026-09-01.*静息心率/);
+  const unworn = walkBodyBattery({ ...inputs, heartRate: [] }, BB_PARAMS);
+  near(unworn.level, BB_PARAMS.initial_level - BB_PARAMS.low_intensity_drain_per_minute);
+  assert.equal(unworn.curve.at(-1).estimated, true);
+});
+
+test("一分钟和不足一分钟只按实际经过时长积分", () => {
+  for (const duration of [1, 0.5, 1.25]) {
+    const start = at(0.25); const end = start + duration * 60000;
+    const walk = walkBodyBattery(batteryInputs({
+      heartRate: [[start, 140], [end, 50]], stress: [[start, 40]],
+      sleeps: [{ start, end, awake: [] }],
+    }), BB_PARAMS);
+    const activityDrain = BB_PARAMS.activity_drain_per_reserve * ((140 - 50) / (BB_PARAMS.max_heart_rate - 50) - BB_PARAMS.activity_reserve_threshold);
+    near(walk.level, BB_PARAMS.initial_level - duration * activityDrain);
+    assert.equal(walk.end, end);
+    assert.deepEqual(walk.curve[0], { t: start, level: BB_PARAMS.initial_level, estimated: false, interval_estimated: false });
+    assert.equal(walk.curve.at(-1).t, end);
+    near(walk.curve.at(-1).level, walk.level);
+    assert.ok(walk.events.every((event) => event.start >= start && event.end <= end));
+    assert.equal(walk.events.find((event) => event.type === "activity").end, end);
+    near(walk.days[0].max, BB_PARAMS.initial_level);
+    near(walk.days[0].drained, BB_PARAMS.initial_level - walk.level);
+  }
+});
+
+test("读数和清醒阶段在带秒的真实边界切换", () => {
+  const start = at(0.1); const end = at(1.6);
+  const walk = walkBodyBattery(batteryInputs({
+    heartRate: [[start, 50], [end, 50]],
+    stress: [[start, 25], [at(0.9), 40]],
+    sleeps: [{ start, end: at(1.2), awake: [[at(0.4), at(0.7)]] }],
+  }), BB_PARAMS);
+  const charged = 0.5 * BB_PARAMS.sleep_charge_per_stress_point * 5 + 0.3 * BB_PARAMS.rest_charge_per_stress_point * 5;
+  const drained = 0.7 * BB_PARAMS.stress_drain_per_stress_point * 40;
+  near(walk.level, BB_PARAMS.initial_level + charged - drained);
+  near(walk.days[0].charged, charged);
+  near(walk.days[0].drained, drained);
+  assert.equal(walk.events.find((event) => event.type === "sleep").end, at(1.2));
+});
+
+test("心率和压力在有效期结束的瞬间过期", () => {
+  const start = at(0.25);
+  const hrEnd = start + (BB_PARAMS.unworn_after_minutes + 0.5) * 60000;
+  const hrWalk = walkBodyBattery(batteryInputs({
+    heartRate: [[start, 50]], stress: [[start, 25]],
+    sleeps: [{ start, end: hrEnd, awake: [] }],
+  }), BB_PARAMS);
+  near(hrWalk.level, BB_PARAMS.initial_level + BB_PARAMS.unworn_after_minutes * BB_PARAMS.sleep_charge_per_stress_point * 5 - 0.5 * BB_PARAMS.low_intensity_drain_per_minute);
+  assert.equal(hrWalk.events.find((event) => event.reason === "heart_rate_unavailable").start, start + BB_PARAMS.unworn_after_minutes * 60000);
+
+  const stressDuration = BB_PARAMS.stress_hold_minutes + 0.5;
+  const stressEnd = start + stressDuration * 60000;
+  const stressWalk = walkBodyBattery(batteryInputs({
+    heartRate: Array.from({ length: Math.ceil(stressDuration) }, (_, i) => [start + i * 60000, 50]),
+    stress: [[start, 25]], sleeps: [{ start, end: stressEnd, awake: [] }],
+  }), BB_PARAMS);
+  near(stressWalk.level, BB_PARAMS.initial_level + BB_PARAMS.stress_hold_minutes * BB_PARAMS.sleep_charge_per_stress_point * 5 - 0.5 * BB_PARAMS.low_intensity_drain_per_minute);
+  assert.equal(stressWalk.curve.at(-1).estimated, true);
+});
+
+test("活动时缺少压力仍标明估算，追加终点读数不会倒改已积分时段", () => {
+  const input = batteryInputs({ heartRate: readings(0, 5, 1, 100), sleeps: [{ start: at(0), end: at(5), awake: [] }] });
+  const walk = walkBodyBattery(input, BB_PARAMS);
+  assert.equal(walk.curve.at(-1).estimated, true);
+  const terminalReading = walkBodyBattery({ ...input, stress: [[at(5), 99]] }, BB_PARAMS);
+  assert.deepEqual(terminalReading, walk);
+});
+
+test("午夜分摊真实时长，跨日充放电收支守恒", () => {
+  const walk = walkBodyBattery(batteryInputs({
+    heartRate: [[at(59.5), 50], [at(60.5), 50]], stress: [[at(59.5), 40]],
+    sleeps: [{ start: at(59.5), end: at(60.5), awake: [] }],
+  }), BB_PARAMS);
+  assert.deepEqual(walk.days.map((day) => day.date), ["2026-09-01", "2026-09-02"]);
+  const halfMinuteDrain = BB_PARAMS.stress_drain_per_stress_point * 40 / 2;
+  near(walk.days[0].drained, halfMinuteDrain);
+  near(walk.days[1].drained, halfMinuteDrain);
+  near(walk.days[0].max, BB_PARAMS.initial_level);
+  near(walk.days[1].max, walk.days[0].min);
+  near(walk.level, BB_PARAMS.initial_level + walk.days.reduce((sum, day) => sum + day.charged - day.drained, 0));
+});
+
+test("补传同一睡眠的清醒阶段和评分，与一次完整上传得到相同电量", (t) => {
+  freezeClock(t);
+  const resentDir = tmpDataDir(); const completeDir = tmpDataDir();
+  const start = Date.parse("2026-09-06T01:00:00+08:00");
+  const timestamp = (m) => new Date(start + m * 60000).toISOString();
+  const sleep = { session_start_time: timestamp(0), session_end_time: timestamp(240), duration_seconds: 14400, stages: [] };
+  const corrected = { ...sleep, score: 90, stages: [{ stage: "awake", start_time: timestamp(60), end_time: timestamp(180), duration_seconds: 7200 }] };
+  const data = {
+    date: "2026-09-06",
+    heart_rate: Array.from({ length: 241 }, (_, m) => ({ timestamp: timestamp(m), value: 50 })),
+    stress: Array.from({ length: 25 }, (_, m) => ({ timestamp: timestamp(m * 10), value: 25 })),
+    resting_heart_rate: [{ timestamp: timestamp(0), value: 50 }],
+  };
+  mergeHealthData(resentDir, { ...data, sleep: [sleep] });
+  mergeHealthData(resentDir, { date: data.date, sleep: [corrected] });
+  mergeHealthData(completeDir, { ...data, sleep: [corrected] });
+  assert.deepEqual(readDay(resentDir, data.date).sleep_sessions, readDay(completeDir, data.date).sleep_sessions);
+  assert.equal(readDay(resentDir, data.date).sleep_sessions[0].score, 90);
+  const query = { data_type: "body_battery", time_range: "today" };
+  const resent = readHealthToolResult(resentDir, query).body_battery;
+  assert.deepEqual(resent, readHealthToolResult(completeDir, query).body_battery);
+  assert.equal(resent.level, Math.round(BB_PARAMS.initial_level + 120 * (BB_PARAMS.sleep_charge_per_stress_point + BB_PARAMS.rest_charge_per_stress_point) * 5));
+  mergeHealthData(resentDir, { date: data.date, sleep: [corrected] });
+  assert.deepEqual(readHealthToolResult(resentDir, query).body_battery, resent);
+});
+
+test("电量工具保留非整分钟时间，缺少基线通过 MCP 明确报错", async (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  const start = "2026-09-06T01:00:15.250+08:00";
+  const end = "2026-09-06T01:01:45.500+08:00";
+  mergeHealthData(dir, {
+    date: "2026-09-06", heart_rate: [{ timestamp: start, value: 140 }, { timestamp: end, value: 140 }],
+    sleep: [{ session_start_time: start, session_end_time: end, duration_seconds: 90.25, stages: [] }],
+  });
+  const server = createHealthMcpServer(dir);
+  const client = new Client({ name: "body-battery-error-test", version: "1" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  t.after(async () => { await client.close(); await server.close(); });
+  const failed = await client.callTool({ name: "health_read", arguments: { data_type: "body_battery" } });
+  assert.equal(failed.isError, true);
+  assert.match(failed.content[0].text, /2026-09-06.*静息心率/);
+
+  mergeHealthData(dir, { date: "2026-09-06", resting_heart_rate: [{ timestamp: end, value: 50 }] });
+  const battery = readHealthToolResult(dir, { data_type: "body_battery", days: 1 }).body_battery;
+  assert.equal(battery.as_of, "9/6 01:01:45.500");
+  assert.equal(battery.curve[0].time, "9/6 01:00:15.250");
+  assert.equal(battery.curve.at(-1).time, battery.as_of);
+  assert.equal(battery.events.find((event) => event.type === "activity").end, battery.as_of);
+});
+
+test("一分钟步数整日快照替换旧五分钟桶，重传和清空都不重复累计", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir(); const date = "2026-09-06";
+  mergeHealthData(dir, { date, steps: [{ timestamp: `${date}T08:00:00+08:00`, value: 50 }, { timestamp: `${date}T08:05:00+08:00`, value: 30 }] });
+  const snapshot = { date, steps_bucket_seconds: 60, steps: Array.from({ length: 8 }, (_, i) => ({ timestamp: `${date}T08:0${i}:00+08:00`, value: 10 })) };
+  mergeHealthData(dir, snapshot);
+  assert.equal(readDay(dir, date).steps.total, 80);
+  assert.equal(readDay(dir, date).steps.samples.length, 8);
+  mergeHealthData(dir, snapshot);
+  assert.equal(readDay(dir, date).steps.total, 80);
+  assert.equal(readHealthToolResult(dir, { data_type: "series" }).series[0].steps_bucket_seconds, 60);
+  mergeHealthData(dir, { date, steps_bucket_seconds: 60, steps: [] });
+  assert.equal(readDay(dir, date).steps.total, 0);
+  assert.deepEqual(readDay(dir, date).steps.samples, []);
+});
+
+test("覆盖区间采用整日替换，空快照移除旧分段，省略字段保留历史", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir(); const date = "2026-09-06";
+  const range = (from, to, status) => ({ timestamp: `${date}T${from}:00+08:00`, end_time: `${date}T${to}:00+08:00`, status });
+  mergeHealthData(dir, { date, heart_rate_coverage: [range("08:00", "09:00", "missing")] });
+  const snapshot = { date, heart_rate_coverage: [range("08:00", "08:30", "observed"), range("08:30", "09:00", "missing")] };
+  mergeHealthData(dir, snapshot);
+  mergeHealthData(dir, snapshot);
+  assert.equal(readDay(dir, date).heart_rate_coverage.length, 2);
+  mergeHealthData(dir, { date, stress: [] });
+  assert.equal(readDay(dir, date).heart_rate_coverage.length, 2);
+  assert.equal(readHealthToolResult(dir, { data_type: "series" }).series[0].heart_rate_coverage.length, 2);
+  mergeHealthData(dir, { date, heart_rate_coverage: [] });
+  assert.deepEqual(readDay(dir, date).heart_rate_coverage, []);
+  assert.throws(() => mergeHealthData(dir, { date, heart_rate_coverage: [range("09:00", "08:00", "missing")] }), /heart_rate_coverage/);
+});
+
+test("压力局部过渡连续，区间外睡眠清醒活动三条分支保持原速率", () => {
+  const level = (pressure, awake, bpm = 50) => walkBodyBattery(batteryInputs({
+    heartRate: readings(0, 1, 1, bpm), stress: [[at(0), pressure]],
+    sleeps: [{ start: at(0), end: at(1), awake: awake ? [[at(0), at(1)]] : [] }],
+  }), BB_PARAMS).level;
+  const threshold = BB_PARAMS.stress_threshold; const width = BB_PARAMS.stress_transition_half_width;
+  for (const awake of [false, true]) {
+    for (const bpm of [50, 93, 140]) {
+      for (const edge of [threshold - width, threshold, threshold + width]) {
+        assert.ok(Math.abs(level(edge - 0.00001, awake, bpm) - level(edge + 0.00001, awake, bpm)) < 0.00001);
+      }
+      for (const pressure of [0, threshold - width, threshold + width, 60, 100]) {
+        const charge = (awake ? BB_PARAMS.rest_charge_per_stress_point : BB_PARAMS.sleep_charge_per_stress_point) * (threshold - pressure);
+        const stressDrain = pressure >= threshold ? BB_PARAMS.stress_drain_per_stress_point * pressure : 0;
+        const reserve = (bpm - 50) / (BB_PARAMS.max_heart_rate - 50);
+        const delta = reserve > BB_PARAMS.activity_reserve_threshold
+          ? -Math.max(BB_PARAMS.low_intensity_drain_per_minute, BB_PARAMS.activity_drain_per_reserve * (reserve - BB_PARAMS.activity_reserve_threshold), stressDrain)
+          : pressure < threshold ? charge : -stressDrain;
+        near(level(pressure, awake, bpm), BB_PARAMS.initial_level + delta);
+      }
+    }
+    near(level(threshold, awake), BB_PARAMS.initial_level - 0.5 * BB_PARAMS.stress_drain_per_stress_point * threshold);
+  }
+  const missing = batteryInputs({ heartRate: [], stress: [[at(0), threshold]], sleeps: [{ start: at(0), end: at(1), awake: [] }] });
+  near(walkBodyBattery(missing, BB_PARAMS).level, BB_PARAMS.initial_level - BB_PARAMS.low_intensity_drain_per_minute);
+  near(walkBodyBattery(missing, { ...BB_PARAMS, stress_transition_half_width: 10 }).level, walkBodyBattery(missing, BB_PARAMS).level);
+});
+
+test("五秒运动心率覆盖分钟心率，点数增加不重复累计时长", () => {
+  const workoutHeartRate = Array.from({ length: 13 }, (_, i) => [at(i / 12), 140]);
+  const input = batteryInputs({ heartRate: [], workoutHeartRate, stress: [[at(0), 30]], sleeps: [{ start: at(0), end: at(1), awake: [] }] });
+  const walk = walkBodyBattery(input, BB_PARAMS);
+  const withMinute = walkBodyBattery({ ...input, heartRate: readings(0, 1, 1, 180) }, BB_PARAMS);
+  assert.deepEqual(withMinute, walk);
+  const rate = BB_PARAMS.activity_drain_per_reserve * ((140 - 50) / (BB_PARAMS.max_heart_rate - 50) - BB_PARAMS.activity_reserve_threshold);
+  near(walk.level, BB_PARAMS.initial_level - rate);
+  near(walk.contributions.activity.minutes, 1);
+  assert.equal(walk.end, at(1));
+});
+
+test("高频末点五秒后过期，不复活更早的分钟心率", () => {
+  const walk = walkBodyBattery(batteryInputs({
+    heartRate: [[at(0), 180]], workoutHeartRate: [[at(0.5), 140]], stress: [[at(0), 30]],
+    sleeps: [{ start: at(0), end: at(1), awake: [] }],
+  }), BB_PARAMS);
+  const gap = walk.events.find((event) => event.reason === "heart_rate_unavailable");
+  assert.equal(gap.start, at(0.5) + 5000);
+  near(walk.estimation.minutes, 25 / 60);
+  const withNewMinute = walkBodyBattery(batteryInputs({
+    heartRate: [[at(0), 180], [at(0.75), 50]], workoutHeartRate: [[at(0.5), 140]], stress: [[at(0), 30]],
+    sleeps: [{ start: at(0), end: at(1), awake: [] }],
+  }), BB_PARAMS);
+  near(withNewMinute.estimation.minutes, 10 / 60);
+});
+
+test("心率按有效期过期后才用原始覆盖区分缺测和未知", () => {
+  const expiry = BB_PARAMS.unworn_after_minutes;
+  const walk = walkBodyBattery(batteryInputs({
+    heartRate: [[at(0), 50]], stress: [[at(0), 25]],
+    heartRateCoverage: [{ start: at(1), end: at(expiry + 0.5), status: "missing" }],
+    sleeps: [{ start: at(0), end: at(expiry + 1), awake: [] }],
+  }), BB_PARAMS);
+  assert.deepEqual(walk.events.filter((event) => event.type === "data_gap").map(({ start, end, reason }) => ({ start, end, reason })), [
+    { start: at(expiry), end: at(expiry + 0.5), reason: "heart_rate_missing" },
+    { start: at(expiry + 0.5), end: at(expiry + 1), reason: "heart_rate_unavailable" },
+  ]);
+  near(walk.contributions.heart_rate_missing.minutes, 0.5);
+  near(walk.contributions.heart_rate_unavailable.minutes, 0.5);
+  near(walk.estimation.minutes, 1);
+});
+
+test("正常十分钟夜间采样的missing分钟不缩短有效期或扩大估算", () => {
+  const input = batteryInputs({
+    heartRate: readings(0, 60, 10, 50), stress: readings(0, 60, 10, 25),
+    sleeps: [{ start: at(0), end: at(60), awake: [] }],
+  });
+  const coverage = Array.from({ length: 6 }, (_, i) => [
+    { start: at(i * 10), end: at(i * 10 + 1), status: "observed" },
+    { start: at(i * 10 + 1), end: at(i * 10 + 10), status: "missing" },
+  ]).flat();
+  const without = walkBodyBattery(input, BB_PARAMS);
+  const withCoverage = walkBodyBattery({ ...input, heartRateCoverage: coverage }, BB_PARAMS);
+  assert.deepEqual(withCoverage, without);
+  near(withCoverage.estimation.minutes, 0);
+});
+
+test("五秒心率过期后按原始覆盖区分缺测，不复用更早普通点", () => {
+  const walk = walkBodyBattery(batteryInputs({
+    heartRate: [[at(0), 50]], workoutHeartRate: [[at(0.5), 140]], stress: [[at(0), 30]],
+    heartRateCoverage: [{ start: at(0.25), end: at(0.75), status: "missing" }],
+    sleeps: [{ start: at(0), end: at(1), awake: [] }],
+  }), BB_PARAMS);
+  near(walk.contributions.activity.minutes, 5 / 60);
+  near(walk.contributions.heart_rate_missing.minutes, 10 / 60);
+  near(walk.contributions.heart_rate_unavailable.minutes, 15 / 60);
+});
+
+test("覆盖区间跨午夜按半开边界切换，已有覆盖不会伪造有效心率", () => {
+  const walk = walkBodyBattery(batteryInputs({
+    heartRate: [], stress: [],
+    heartRateCoverage: [
+      { start: at(59.5), end: at(60), status: "missing" },
+      { start: at(60), end: at(60.5), status: "observed" },
+    ],
+    sleeps: [{ start: at(59.5), end: at(59.6), awake: [] }],
+  }), BB_PARAMS);
+  assert.equal(walk.end, at(60.5));
+  near(walk.days[0].estimated_minutes, 0.5);
+  near(walk.days[1].estimated_minutes, 0.5);
+  assert.equal(walk.events.find((event) => event.reason === "heart_rate_missing").end, at(60));
+  assert.equal(walk.events.find((event) => event.reason === "heart_rate_unavailable").start, at(60));
+});
+
+test("恢复观测后累计估算仍保留，贡献收支等于电量变化", () => {
+  const walk = walkBodyBattery(batteryInputs({
+    heartRate: readings(20, 60, 1, 50), stress: readings(20, 60, 10, 25),
+    sleeps: [{ start: at(0), end: at(60), awake: [] }],
+  }), BB_PARAMS);
+  assert.equal(walk.curve.at(-1).estimated, true);
+  assert.equal(walk.curve.at(-1).interval_estimated, false);
+  near(walk.estimation.minutes, 20);
+  near(walk.estimation.drained, 20 * BB_PARAMS.low_intensity_drain_per_minute);
+  const contributions = Object.values(walk.contributions);
+  near(contributions.reduce((sum, value) => sum + value.minutes, 0), 60);
+  near(contributions.reduce((sum, value) => sum + value.charged - value.drained, 0), walk.level - BB_PARAMS.initial_level);
+});
+
+test("运动恢复心率跨午夜不被运动结束截断，补传与一次上传一致", (t) => {
+  freezeClock(t);
+  const partialDir = tmpDataDir(); const fullDir = tmpDataDir();
+  const day = "2026-09-05"; const nextDay = "2026-09-06";
+  const start = Date.parse(`${day}T23:59:30+08:00`);
+  const stamp = (seconds) => new Date(start + seconds * 1000).toISOString();
+  const points = Array.from({ length: 13 }, (_, i) => ({ timestamp: stamp(i * 5), value: i < 6 ? 140 : 80 }));
+  const workout = { timestamp: stamp(0), end_time: stamp(30), duration_seconds: 30, activity: "indoor_cycling", heart_rate: points };
+  const base = { date: day, stress: [{ timestamp: stamp(0), value: 30 }], resting_heart_rate: [{ timestamp: stamp(0), value: 50 }] };
+  const sleep = { date: day, sleep: [{ session_start_time: stamp(0), session_end_time: stamp(10), duration_seconds: 10, stages: [] }] };
+  for (const dir of [partialDir, fullDir]) { mergeHealthData(dir, base); mergeHealthData(dir, sleep); }
+  mergeHealthData(partialDir, { date: day, workouts: [{ ...workout, heart_rate: points.slice(0, 6) }] });
+  mergeHealthData(partialDir, { date: day, workouts: [workout] });
+  mergeHealthData(fullDir, { date: day, workouts: [workout] });
+  const request = { data_type: "body_battery", days: 3 };
+  const result = readHealthToolResult(partialDir, request).body_battery;
+  assert.deepEqual(result, readHealthToolResult(fullDir, request).body_battery);
+  assert.equal(result.as_of, "9/6 00:00:30");
+  assert.deepEqual(result.daily.map((value) => value.date), [day, nextDay]);
+  assert.equal(result.observed_max_heart_rate, 140);
+  assert.equal(result.initial.source, "configured");
+  assert.equal(result.estimated, false);
+  const raw = readHealthToolResult(partialDir, { data_type: "series", days: 3 }).series[0];
+  assert.deepEqual(raw.workouts[0].heart_rate, points);
+  const today = readHealthToolResult(partialDir, { data_type: "body_battery", days: 1 }).body_battery;
+  assert.equal(today.level, result.level);
+  assert.deepEqual(today.contributions, result.contributions);
+  mergeHealthData(partialDir, { date: day, workouts: [workout] });
+  assert.deepEqual(readHealthToolResult(partialDir, request).body_battery, result);
 });
