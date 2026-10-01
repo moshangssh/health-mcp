@@ -16,6 +16,10 @@ function readDay(dir, date) {
   return JSON.parse(fs.readFileSync(path.join(dir, `${date}.json`), "utf8"));
 }
 
+function readJson(name) {
+  return JSON.parse(fs.readFileSync(path.join(__dirname, name), "utf8"));
+}
+
 // The read path resolves "today" from the wall clock, and these two flows use fixtures pinned to
 // 2026-09-06. Freezing Date there keeps the suite independent of the day it runs on.
 const FROZEN_NOW = new Date("2026-09-06T04:00:00Z");
@@ -274,7 +278,7 @@ test("MCP exposes the public health read contract and custom day ranges", async 
   await client.connect(clientTransport);
   const tools = await client.listTools();
   assert.deepEqual(tools.tools.map((tool) => tool.name), ["health_read"]);
-  assert.deepEqual(Object.keys(tools.tools[0].inputSchema.properties), ["data_type", "time_range", "heart_rate_detail", "days"]);
+  assert.deepEqual(Object.keys(tools.tools[0].inputSchema.properties), ["data_type", "time_range", "heart_rate_detail", "training_load_detail", "method", "activity", "days"]);
   const steps = JSON.parse((await client.callTool({ name: "health_read", arguments: { data_type: "steps", days: 5 } })).content[0].text);
   assert.equal(steps.summaries.length, 5);
   const hourly = JSON.parse((await client.callTool({ name: "health_read", arguments: { data_type: "heart_rate", heart_rate_detail: "hourly", time_range: "today" } })).content[0].text);
@@ -629,7 +633,8 @@ test("invalid calendar dates are rejected and repeated clear stays successful", 
 
 // Body battery: the walk runs on constructed minute series, so each rule shows on its own against the
 // shipped parameter file.
-const BB_PARAMS = JSON.parse(fs.readFileSync(path.join(__dirname, "body-battery.json"), "utf8"));
+// 最大心率搬到了身体电量和训练负荷共用的 heart-rate.json，walkBodyBattery 收到的仍是合并后的参数。
+const BB_PARAMS = { ...readJson("body-battery.json"), ...readJson("heart-rate.json") };
 const BB_T0 = Date.parse("2026-09-01T23:00:00+08:00");
 const at = (minute) => BB_T0 + minute * 60000;
 
@@ -1072,4 +1077,186 @@ test("运动恢复心率跨午夜不被运动结束截断，补传与一次上�
   assert.deepEqual(today.contributions, result.contributions);
   mergeHealthData(partialDir, { date: day, workouts: [workout] });
   assert.deepEqual(readHealthToolResult(partialDir, request).body_battery, result);
+});
+
+// 训练负荷：走完整读取路径，从落盘的原始运动对象算出三种口径，再按方法和运动类型读回。
+const TL_PARAMS = readJson("training-load.json");
+const MAX_HEART_RATE = readJson("heart-rate.json").max_heart_rate;
+
+function workoutHeartRate(startIso, segments) {
+  const samples = [];
+  let second = 0;
+  for (const [minutes, bpm] of segments) {
+    for (let index = 0; index < minutes * 12; index += 1) {
+      samples.push({ timestamp: new Date(Date.parse(startIso) + second * 1000).toISOString(), value: bpm });
+      second += 5;
+    }
+  }
+  return samples;
+}
+
+// 2026-09-05 一小时跑（心率分段），2026-09-06 半小时骑行，两天各有一条静息心率。
+function trainingFixtures(dir) {
+  const resting = (date) => ({ resting_heart_rate: [{ timestamp: `${date}T06:00:00+08:00`, value: 50 }] });
+  mergeHealthData(dir, { date: "2026-09-05", ...resting("2026-09-05"), workouts: [{
+    timestamp: "2026-09-05T07:00:00+08:00", end_time: "2026-09-05T08:00:00+08:00", duration_seconds: 3600,
+    activity: "running", avg_heart_rate: 140, workout_load: 42,
+    heart_rate: workoutHeartRate("2026-09-05T07:00:00+08:00", [[10, 120], [40, 140], [10, 160]]),
+  }] });
+  mergeHealthData(dir, { date: "2026-09-06", ...resting("2026-09-06"), workouts: [{
+    timestamp: "2026-09-06T07:00:00+08:00", end_time: "2026-09-06T07:30:00+08:00", duration_seconds: 1800,
+    activity: "indoor_cycling", avg_heart_rate: 130, workout_load: 21,
+    heart_rate: workoutHeartRate("2026-09-06T07:00:00+08:00", [[30, 130]]),
+  }] });
+  return dir;
+}
+
+const tlRead = (dir, args) => readHealthToolResult(dir, { data_type: "training_load", ...args }).training_load;
+
+test("训练负荷按方法和运动类型读取，今天标记为暂定", (t) => {
+  freezeClock(t);
+  const dir = trainingFixtures(tmpDataDir());
+  const result = tlRead(dir, { days: 3 });
+
+  assert.equal(result.method, "trimp_average");
+  assert.equal(result.unit, "trimp");
+  assert.equal(result.activity, "all");
+  assert.equal(result.metadata.parameters.max_heart_rate, MAX_HEART_RATE);
+  assert.equal(result.metadata.parameters.max_heart_rate_source, "heart-rate.json");
+  assert.equal(result.metadata.parameters.ctl_time_constant_days, TL_PARAMS.ctl_time_constant_days);
+  assert.equal(result.metadata.formula_source, TL_PARAMS.formula_source);
+  assert.equal(result.metadata.data_scope, "recorded_workouts");
+  assert.equal(result.metadata.sync_completeness, "unverified");
+  assert.deepEqual(result.initialization, {
+    start_date: "2026-09-05", initial_ctl: 0, initial_atl: 0,
+    initial_value_source: "configured", days_computed: 2, assumes_no_prior_training: false,
+  });
+  // 只返回查询窗口内的日期，窗口外的历史照常参与递推。
+  assert.deepEqual(result.daily.map((day) => day.date), ["2026-09-05", "2026-09-06"]);
+  assert.equal(result.window.days, 3);
+  assert.equal(result.daily[0].load, 84.8, "一小时 × 平均心率 140 的 TRIMP");
+  assert.equal(result.daily[0].ctl, 2, "首日 CTL 是当日负荷按 42 天时间常数递推");
+  assert.equal(result.daily[1].provisional, true);
+  assert.equal(result.summary.date, "2026-09-06");
+  assert.equal(result.summary.tsb, -9.3, "TSB 是当天训练前的 CTL 与 ATL 之差");
+  assert.equal(result.summary.provisional, true);
+  assert.equal(result.window_load, 117.7);
+
+  // 三种口径各自独立：设备负荷用 workout_load，积分法按心率序列积分。
+  assert.equal(tlRead(dir, { days: 3, method: "device_load" }).daily[0].load, 42);
+  assert.equal(tlRead(dir, { days: 3, method: "device_load" }).unit, "workout_load");
+  assert.equal(tlRead(dir, { days: 3, method: "trimp_integrated" }).daily[0].load, 87.6);
+
+  const cycling = tlRead(dir, { days: 3, activity: "indoor_cycling" });
+  assert.equal(cycling.activity, "indoor_cycling");
+  assert.equal(cycling.initialization.start_date, "2026-09-06");
+  assert.deepEqual(cycling.daily.map((day) => day.load), [32.9], "按类型读取时序列从该类型的首场运动起算");
+  assert.equal(cycling.activities, undefined, "按类型读取时不再另外拆分");
+
+  assert.deepEqual(result.activities.map((entry) => entry.activity), ["indoor_cycling", "running"]);
+  near(result.activities.reduce((sum, entry) => sum + entry.load, 0), result.window_load, "全部运动等于各类型之和");
+  assert.equal(result.activities[0].workouts, 1);
+});
+
+test("训练负荷明细给出每场运动的三种口径、覆盖时间与分日依据", (t) => {
+  freezeClock(t);
+  const dir = trainingFixtures(tmpDataDir());
+  const [cycling, running] = tlRead(dir, { days: 3, training_load_detail: "workouts" }).workouts;
+
+  assert.equal(running.type, "running");
+  assert.equal(running.start, "9/5 07:00");
+  assert.equal(running.end, "9/5 08:00");
+  assert.equal(running.duration_seconds, 3600);
+  assert.deepEqual(running.dates, ["2026-09-05"]);
+  assert.deepEqual(running.daily_split, [{ date: "2026-09-05", load: 84.8, allocation: "exact" }]);
+  assert.deepEqual(running.loads.trimp_average.basis, {
+    duration_seconds: 3600, average_heart_rate: 140, resting_heart_rate: 50,
+    resting_heart_rate_date: "2026-09-05", max_heart_rate: MAX_HEART_RATE, hr_ratio: 0.643,
+  });
+  assert.equal(running.loads.trimp_integrated.coverage.covered_seconds, 3600);
+  assert.equal(running.loads.trimp_integrated.coverage.uncovered_seconds, 0);
+  assert.deepEqual(running.loads.device_load, { load: 42, status: "computed", basis: { field: "workout_load" } });
+
+  assert.equal(cycling.type, "indoor_cycling");
+  assert.equal(cycling.loads.trimp_integrated.load, 32.9);
+});
+
+test("改查询窗口不改变同一天的训练负荷结果", (t) => {
+  freezeClock(t);
+  const dir = trainingFixtures(tmpDataDir());
+  const short = tlRead(dir, { days: 2 });
+  const long = tlRead(dir, { days: 30 });
+  assert.deepEqual(short.daily, long.daily.slice(-2));
+  assert.deepEqual(short.summary, long.summary);
+  assert.deepEqual(short.initialization, long.initialization);
+});
+
+test("补传和修正后的运动会重算训练负荷", (t) => {
+  freezeClock(t);
+  const partial = tmpDataDir();
+  const complete = tmpDataDir();
+  const running = {
+    timestamp: "2026-09-05T07:00:00+08:00", end_time: "2026-09-05T08:00:00+08:00", duration_seconds: 3600,
+    activity: "running", avg_heart_rate: 140, workout_load: 42,
+    heart_rate: workoutHeartRate("2026-09-05T07:00:00+08:00", [[10, 120], [40, 140], [10, 160]]),
+  };
+  const firstHalf = { ...running, heart_rate: running.heart_rate.slice(0, 2400) };
+  for (const dir of [partial, complete]) mergeHealthData(dir, { date: "2026-09-05", resting_heart_rate: [{ timestamp: "2026-09-05T06:00:00+08:00", value: 50 }] });
+  // 先传一段残缺的心率序列，再补一次完整的：与一次传完整结果一致。
+  mergeHealthData(partial, { date: "2026-09-05", workouts: [firstHalf] });
+  mergeHealthData(partial, { date: "2026-09-05", workouts: [running] });
+  mergeHealthData(complete, { date: "2026-09-05", workouts: [running] });
+  assert.deepEqual(tlRead(partial, { days: 2 }), tlRead(complete, { days: 2 }));
+
+  // 同一开始时间的记录被修正后，负荷跟着变。
+  const before = tlRead(complete, { days: 2 }).daily[0].load;
+  mergeHealthData(complete, { date: "2026-09-05", workouts: [{ ...running, duration_seconds: 1800, end_time: "2026-09-05T07:30:00+08:00" }] });
+  assert.equal(tlRead(complete, { days: 2 }).daily[0].load, before / 2);
+});
+
+test("没有运动记录与运动算不出来是两种状态", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  assert.equal(readHealthToolResult(dir, { data_type: "training_load", days: 3 }).training_load, null, "全历史没有运动时没有可递推的序列");
+
+  // 有运动但缺平均心率、缺设备负荷，也不产生静息心率：算不出来的一天保留缺失状态。
+  mergeHealthData(dir, { date: "2026-09-05", workouts: [{ timestamp: "2026-09-05T07:00:00+08:00", duration_seconds: 3600, activity: "running" }] });
+  const result = tlRead(dir, { days: 3 });
+  assert.deepEqual(result.daily.map((day) => day.date), ["2026-09-05", "2026-09-06"]);
+  assert.equal(result.daily[0].load_status, "partial");
+  assert.equal(result.daily[0].workouts, 1);
+  // 每种口径只报自己的缺失原因，互不影响。
+  assert.deepEqual(result.daily[0].uncomputable, [{ activity: "running", reason: "missing_average_heart_rate" }]);
+  assert.deepEqual(tlRead(dir, { days: 3, method: "trimp_integrated" }).daily[0].uncomputable, [{ activity: "running", reason: "no_heart_rate_samples" }]);
+  assert.deepEqual(tlRead(dir, { days: 3, method: "device_load" }).daily[0].uncomputable, [{ activity: "running", reason: "missing_workout_load" }]);
+  assert.equal(result.daily[0].load, 0, "已计算部分的负荷小计");
+  assert.equal(result.daily[0].ctl, null, "不把缺失的负荷当作零，不给貌似完整的指标");
+  assert.equal(result.daily[0].metrics_status, "blocked");
+  assert.equal(result.daily[1].metrics_status, "blocked", "缺失状态保留到之后的日期");
+  assert.equal(result.daily[1].blocked_since, "2026-09-05");
+  assert.equal(result.daily[1].load_status, "complete", "这一天没有已入库运动，不是算不出来");
+  assert.equal(result.daily[1].workouts, 0);
+  assert.equal(result.summary.ctl, null);
+
+  // 静息心率缺失只影响两种 TRIMP，设备负荷照常。
+  mergeHealthData(dir, { date: "2026-09-05", workouts: [{ timestamp: "2026-09-05T07:00:00+08:00", duration_seconds: 3600, activity: "running", workout_load: 30 }] });
+  const deviceOnly = tlRead(dir, { days: 3, method: "device_load" });
+  assert.equal(deviceOnly.daily[0].load, 30);
+  assert.equal(deviceOnly.daily[0].ctl, 0.7, "设备负荷的输入齐全，照常递推");
+});
+
+test("最大心率取自两个算法共用的配置文件", (t) => {
+  freezeClock(t);
+  const dir = trainingFixtures(tmpDataDir());
+  const minutes = Array.from({ length: 420 }, (_, index) => new Date(Date.parse("2026-09-05T23:00:00+08:00") + index * 60000).toISOString());
+  mergeHealthData(dir, {
+    date: "2026-09-06",
+    heart_rate: minutes.map((timestamp) => ({ timestamp, value: 52 })),
+    stress: minutes.filter((_, index) => index % 10 === 0).map((timestamp) => ({ timestamp, value: 18, level: 1 })),
+    sleep: [{ session_start_time: "2026-09-05T23:00:00+08:00", session_end_time: "2026-09-06T06:00:00+08:00", duration_seconds: 25200, stages: [] }],
+  });
+  const battery = readHealthToolResult(dir, { data_type: "body_battery", days: 3 }).body_battery;
+  assert.equal(battery.max_heart_rate_setting, MAX_HEART_RATE);
+  assert.equal(readJson("body-battery.json").max_heart_rate, undefined, "身体电量参数文件里不再另存一份最大心率");
+  assert.equal(tlRead(dir, { days: 3 }).metadata.parameters.max_heart_rate, MAX_HEART_RATE);
 });

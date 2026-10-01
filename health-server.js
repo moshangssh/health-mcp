@@ -7,12 +7,14 @@ const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { hostHeaderValidation } = require("@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js");
 const { z } = require("zod");
 const { buildAllowedHosts, installRequestObservability, mountMcpEndpoint } = require("./shared/http-runtime");
+const { METHODS: TRAINING_LOAD_METHODS, METHOD_UNITS, addDays, computeTrainingLoad } = require("./training-load");
 
 const DEFAULT_DATA_DIR = "/var/lib/health-mcp";
 const VALID_TYPES = new Set(["steps", "heart_rate", "sleep", "workouts", "all"]);
-const DATA_TYPES = ["current_status", "steps", "heart_rate", "sleep", "workouts", "daily_summary", "series", "body_battery", "all"];
+const DATA_TYPES = ["current_status", "steps", "heart_rate", "sleep", "workouts", "daily_summary", "series", "body_battery", "training_load", "all"];
 const TIME_RANGES = ["three_days", "today"];
 const HEART_RATE_DETAILS = ["daily", "hourly"];
+const TRAINING_LOAD_DETAILS = ["summary", "workouts"];
 const MAX_READ_DAYS = 62;
 const TZ = process.env.HEALTH_TZ || "Asia/Shanghai";
 
@@ -271,6 +273,14 @@ function mergeSleepSessionsForDate(dataDir, date, incoming, updatedAt) {
 
 function round1(value) {
   return Math.round(value * 10) / 10;
+}
+
+function round3(value) {
+  return Math.round(value * 1000) / 1000;
+}
+
+function roundOrNull(value) {
+  return value === null || value === undefined ? null : round1(value);
 }
 
 // SpO2, stress, HRV, skin temperature and resting heart rate all arrive as timestamped readings
@@ -695,7 +705,14 @@ function hourlyHeartRateSummaries(records) {
 // never reset. Every rate and threshold lives in body-battery.json at the project root and is read on
 // each call, so a tuned value applies to the whole history at once.
 const BODY_BATTERY_PARAMS_PATH = path.join(__dirname, "body-battery.json");
+// 最大心率只有这一份，身体电量和训练负荷都读它，两个算法不各存一个值。
+const HEART_RATE_PARAMS_PATH = path.join(__dirname, "heart-rate.json");
+const TRAINING_LOAD_PARAMS_PATH = path.join(__dirname, "training-load.json");
 const MINUTE_MS = 60000;
+
+function readMaxHeartRate() {
+  return JSON.parse(fs.readFileSync(HEART_RATE_PARAMS_PATH, "utf8")).max_heart_rate;
+}
 const BODY_BATTERY_EVENTS = ["sleep", "activity", "data_gap", "high_stress"];
 
 // Only the readings the walk needs, pulled out of each day file as it is read, so a year of history
@@ -875,7 +892,7 @@ function formatBodyBatteryClock(ms) {
 }
 
 function bodyBattery(dataDir, days) {
-  const params = JSON.parse(fs.readFileSync(BODY_BATTERY_PARAMS_PATH, "utf8"));
+  const params = { ...JSON.parse(fs.readFileSync(BODY_BATTERY_PARAMS_PATH, "utf8")), max_heart_rate: readMaxHeartRate() };
   const inputs = readBodyBatteryInputs(dataDir);
   // The walk starts at the first night's sleep; before one is on record there is no battery yet.
   if (!inputs.sleeps.length) return null;
@@ -898,6 +915,155 @@ function bodyBattery(dataDir, days) {
     daily: walk.days.filter((day) => day.date >= fromDate).map((day) => ({ date: day.date, max: Math.round(day.max), min: Math.round(day.min), charged: Math.round(day.charged), drained: Math.round(day.drained), estimated_minutes: round1(day.estimated_minutes) })),
     events: walk.events.filter((event) => shown(event.end)).map((event) => ({ type: event.type, start: formatBodyBatteryClock(event.start), end: formatBodyBatteryClock(event.end), change: event.change, ...(event.reason ? { reason: event.reason } : {}) })),
     curve: walk.curve.filter((point) => shown(point.t)).map((point) => ({ time: formatBodyBatteryClock(point.t), level: Math.round(point.level), ...(point.estimated ? { estimated: true } : {}), ...(point.interval_estimated ? { interval_estimated: true } : {}) })),
+  };
+}
+
+// 训练负荷：只读历史日文件里的运动原始对象和秒级时长，不用展示层已经四舍五入到整数分钟的结果。
+// 每次调用重算全历史，补传、修正和配置改动自然生效，不设缓存失效机制。
+function readTrainingLoadInputs(dataDir) {
+  const workouts = [];
+  const restingByDate = new Map();
+  const files = fs.readdirSync(dataDir).filter((name) => /^\d{4}-\d{2}-\d{2}\.json$/.test(name)).sort();
+  for (const name of files) {
+    const record = readRecord(path.join(dataDir, name), null);
+    for (const workout of record.workouts || []) workouts.push(workout);
+    // 当日最新一条静息心率代表这一天，与身体电量同一条取值规则。
+    const latest = (record.resting_heart_rate?.samples || []).reduce((newest, sample) => (!newest || Date.parse(sample.ts) > Date.parse(newest.ts) ? sample : newest), null);
+    const value = nullableNumber(latest?.value);
+    if (value !== null) restingByDate.set(record.date || name.slice(0, 10), value);
+  }
+  return { workouts, restingByDate };
+}
+
+function trainingLoadDay(day) {
+  return {
+    date: day.date,
+    load: round1(day.load),
+    load_status: day.load_status,
+    workouts: day.workouts,
+    ...(day.uncomputable.length ? { uncomputable: day.uncomputable } : {}),
+    ctl: roundOrNull(day.ctl),
+    atl: roundOrNull(day.atl),
+    tsb: roundOrNull(day.tsb),
+    balance_end_of_day: roundOrNull(day.balance_end_of_day),
+    ramp_rate: roundOrNull(day.ramp_rate),
+    metrics_status: day.metrics_status,
+    ...(day.blocked_since ? { blocked_since: day.blocked_since } : {}),
+    ...(day.provisional ? { provisional: true } : {}),
+  };
+}
+
+function trainingLoadWorkout(workout, method) {
+  const loads = {};
+  for (const name of TRAINING_LOAD_METHODS) {
+    const entry = workout.loads[name];
+    loads[name] = { load: roundOrNull(entry.load), status: entry.status, ...(entry.reason ? { reason: entry.reason } : {}) };
+    if (entry.coverage) {
+      loads[name].coverage = {
+        span_seconds: roundOrNull(entry.coverage.span_seconds),
+        covered_seconds: roundOrNull(entry.coverage.covered_seconds),
+        uncovered_seconds: roundOrNull(entry.coverage.uncovered_seconds),
+        coverage_ratio: entry.coverage.coverage_ratio === undefined ? null : round3(entry.coverage.coverage_ratio),
+        sample_count: entry.coverage.sample_count,
+        excluded_recovery_samples: entry.coverage.excluded_recovery_samples,
+        excluded_leading_samples: entry.coverage.excluded_leading_samples,
+      };
+    }
+    if (entry.basis) {
+      loads[name].basis = entry.basis.hr_ratio === undefined ? entry.basis : { ...entry.basis, hr_ratio: round3(entry.basis.hr_ratio) };
+    }
+  }
+  return {
+    type: workout.activity,
+    ...(workout.name ? { name: workout.name } : {}),
+    start: formatLocalClock(workout.start_ms),
+    end: workout.end_ms === null ? null : formatLocalClock(workout.end_ms),
+    duration_seconds: workout.duration_seconds,
+    dates: workout.span_dates ?? [workout.start_date],
+    loads,
+    daily_split: (workout.splits[method] ?? []).map((part) => ({ date: part.date, load: round1(part.load), allocation: part.allocation })),
+  };
+}
+
+function trainingLoad(dataDir, days, args = {}, now = new Date()) {
+  const params = JSON.parse(fs.readFileSync(TRAINING_LOAD_PARAMS_PATH, "utf8"));
+  const maxHeartRate = readMaxHeartRate();
+  const method = TRAINING_LOAD_METHODS.includes(args.method) ? args.method : TRAINING_LOAD_METHODS[0];
+  const activity = typeof args.activity === "string" && args.activity.trim() ? args.activity.trim() : null;
+  const today = formatLocalDate(now);
+  const fromDate = addDays(today, -(days - 1));
+  const computed = computeTrainingLoad({
+    ...readTrainingLoadInputs(dataDir),
+    maxHeartRate,
+    params,
+    formatDate: (millis) => formatLocalDate(new Date(millis)),
+    today,
+  });
+  // 全历史没有已入库运动时没有可递推的序列；「有运动但算不出来」是另一回事，由每天的缺失状态表达。
+  if (computed.start_date === null) return null;
+  const full = activity === null ? computed.methods[method].all : (computed.methods[method].activities[activity] ?? []);
+  const daily = full.filter((day) => day.date >= fromDate).map(trainingLoadDay);
+  const inWindow = (workout) => (workout.span_dates ?? [workout.start_date]).some((date) => date >= fromDate);
+  const windowWorkouts = computed.workouts.filter(inWindow);
+  const dayLoad = (series) => round1(series.filter((day) => day.date >= fromDate).reduce((sum, day) => sum + day.load, 0));
+  return {
+    method,
+    unit: METHOD_UNITS[method],
+    activity: activity ?? "all",
+    metadata: {
+      timezone: TZ,
+      formula: params.formula,
+      formula_source: params.formula_source,
+      parameters: {
+        max_heart_rate: maxHeartRate,
+        max_heart_rate_source: "heart-rate.json",
+        trimp_coefficient_a: params.trimp_coefficient_a,
+        trimp_coefficient_b: params.trimp_coefficient_b,
+        ctl_time_constant_days: params.ctl_time_constant_days,
+        atl_time_constant_days: params.atl_time_constant_days,
+        ramp_rate_days: params.ramp_rate_days,
+        initial_ctl: params.initial_ctl,
+        initial_atl: params.initial_atl,
+        duration_field: params.duration_field,
+        hr_hold_seconds: params.hr_hold_seconds,
+      },
+      resting_heart_rate_rule: "运动开始日当天的一条静息心率，当日没有则沿用最近一个更早的日期，不用全天最低心率代替",
+      data_scope: "recorded_workouts",
+      sync_completeness: "unverified",
+      available_methods: TRAINING_LOAD_METHODS.map((name) => ({ method: name, unit: METHOD_UNITS[name] })),
+      workouts_in_history: computed.workouts.length,
+      workouts_in_window: windowWorkouts.length,
+      unplaced_workouts: computed.unplaced_workouts,
+    },
+    // 从本地最早运动日期起、以配置里明确声明的初值递推：这是从现有记录建立的模型，不假设用户此前没有训练。
+    initialization: {
+      start_date: full[0]?.date ?? null,
+      initial_ctl: params.initial_ctl,
+      initial_atl: params.initial_atl,
+      initial_value_source: "configured",
+      days_computed: full.length,
+      assumes_no_prior_training: false,
+    },
+    window: { from_date: fromDate, to_date: today, days },
+    window_load: dayLoad(full),
+    summary: daily.at(-1) ?? null,
+    daily,
+    ...(activity === null ? {
+      activities: computed.activities.map((name) => {
+        const series = computed.methods[method].activities[name];
+        return {
+          activity: name,
+          start_date: series[0].date,
+          days_computed: series.length,
+          load: dayLoad(series),
+          workouts: computed.workouts.filter((workout) => workout.activity === name && inWindow(workout)).length,
+          summary: trainingLoadDay(series.filter((day) => day.date >= fromDate).at(-1)),
+        };
+      }),
+    } : {}),
+    ...(args.training_load_detail === "workouts"
+      ? { workouts: [...windowWorkouts].sort((a, b) => b.start_ms - a.start_ms).map((workout) => trainingLoadWorkout(workout, method)) }
+      : {}),
   };
 }
 
@@ -932,6 +1098,7 @@ function readHealthToolResult(dataDir, args = {}) {
   if (dataType === "daily_summary") return withContext({ ...range, summaries });
   if (dataType === "series") return withContext({ ...range, series: records.map(seriesForRecord) });
   if (dataType === "body_battery") return withContext({ ...range, body_battery: bodyBattery(dataDir, days) });
+  if (dataType === "training_load") return withContext({ ...range, training_load: trainingLoad(dataDir, days, args) });
   return withContext({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, today_heart_rate: latestSample(todayRecord), spo2: latestSeriesValue(todayRecord, "spo2"), stress: latestSeriesValue(todayRecord, "stress"), hrv: latestSeriesValue(todayRecord, "hrv"), temperature: latestSeriesValue(todayRecord, "temperature"), sleep_score: nullableNumber(latestSleepStats(todayRecord)?.sleep_score), today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, recent_sleep_list: sleep, summaries });
 }
 
@@ -961,10 +1128,13 @@ function buildSummaryText(records) {
 
 function createHealthMcpServer(dataDir) {
   const server = new McpServer({ name: "health", version: "1.1.0" });
-  server.tool("health_read", "读取健康数据：当前状态、步数、心率、睡眠、运动记录、每日摘要、带时间戳的原始序列、身体电量或完整数据。", {
+  server.tool("health_read", "读取健康数据：当前状态、步数、心率、睡眠、运动记录、每日摘要、带时间戳的原始序列、身体电量、训练负荷或完整数据。", {
     data_type: z.enum(DATA_TYPES).optional(),
     time_range: z.enum(TIME_RANGES).optional(),
     heart_rate_detail: z.enum(HEART_RATE_DETAILS).optional(),
+    training_load_detail: z.enum(TRAINING_LOAD_DETAILS).optional(),
+    method: z.enum(TRAINING_LOAD_METHODS).optional(),
+    activity: z.string().optional(),
     days: z.number().int().min(1).max(MAX_READ_DAYS).optional(),
   }, async (args) => ({
     content: [{ type: "text", text: JSON.stringify(readHealthToolResult(dataDir, args), null, 2) }],
@@ -1059,5 +1229,6 @@ module.exports = {
   readProfile,
   storeCycleConfig,
   storeProfile,
+  trainingLoad,
   walkBodyBattery,
 };

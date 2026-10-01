@@ -8,6 +8,10 @@ services:
       - ./data:/data
       # 身体电量参数，每次读取时重新加载，改完不用重启
       - ./body-battery.json:/app/body-battery.json:ro
+      # 身体电量和训练负荷共用的最大心率
+      - ./heart-rate.json:/app/heart-rate.json:ro
+      # 训练负荷公式系数与时间常数
+      - ./training-load.json:/app/training-load.json:ro
     # 只绑宿主机回环，公网入口交给 Caddy/Nginx/Tunnel
     ports:
       - "127.0.0.1:${HEALTH_MCP_PORT}:${HEALTH_MCP_PORT}"

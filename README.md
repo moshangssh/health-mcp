@@ -55,10 +55,11 @@ curl http://127.0.0.1:3100/healthz   # 返回 {"ok":true,...}
 
 服务只暴露一个 `health_read` 工具：
 
-- `data_type`：`current_status`、`steps`、`heart_rate`、`sleep`、`workouts`、`daily_summary`、`series`、`body_battery`、`all`
+- `data_type`：`current_status`、`steps`、`heart_rate`、`sleep`、`workouts`、`daily_summary`、`series`、`body_battery`、`training_load`、`all`
 - `time_range`：`today` 或 `three_days`
 - `days`：除 `current_status` 外可自定义读取 1～62 天；传入后优先于 `time_range`
 - `heart_rate_detail`：仅用于 `heart_rate`，可选 `daily` 或 `hourly`；小时模式只返回每小时统计，不返回原始样本
+- `method`、`activity`、`training_load_detail`：仅用于 `training_load`，见下
 
 不传参数时返回紧凑的当前状态。`daily_summary` 每天包含步数、卡路里、距离、心率、静息心率、血氧、
 压力、HRV、体温、睡眠分数、睡眠摘要和手环的夜间报告；`current_status` 额外给出各指标当天最新一次读数；`workouts`
@@ -134,8 +135,74 @@ curl http://127.0.0.1:3100/healthz   # 返回 {"ok":true,...}
 新增 `workout_heart_rate_hold_seconds` 和 `stress_transition_half_width`，部署新代码时需一起更新参数文件。
 过渡半宽 5 只是可调工程平滑宽度，不是华为官方参数或个体生理校准值。
 默认速率不是佳明的真实算法，也没有实测校准过；初始电量和充放电速率是模型假设，分数不代表真实剩余能量百分比。
-睡眠心率、静息心率取自手环，最大心率是参数（默认 190）。HRV、血氧、夜间基线、深睡连续性得分和步数
+睡眠心率、静息心率取自手环。HRV、血氧、夜间基线、深睡连续性得分和步数
 继续保留查询，本轮不增加其电量权重；`*_day_to_baseline` 只是天数进度，不能作为生理偏差加减分。
+
+最大心率（默认 190）在 [`heart-rate.json`](heart-rate.json) 里，身体电量和训练负荷共用同一个值，
+两个算法不各存一份；`body_battery` 输出的 `max_heart_rate_setting` 和 `training_load` 的
+`metadata.parameters.max_heart_rate` 都来自这里。训练负荷的公式系数、时间常数与采样规则在
+[`training-load.json`](training-load.json) 里，同样是每次调用重新读取。三个参数文件在容器里都挂了只读卷，
+改完不用重启、也不用重建镜像。
+
+`training_load` 返回训练负荷：由已入库运动算出的每日负荷，以及在该负荷上按指数时间常数递推的
+CTL、ATL、TSB 和 7 天 Ramp Rate。参数为 `method`（`trimp_average` 默认、`trimp_integrated`、`device_load`）、
+`activity`（按运动类型读取，默认全部运动）和 `training_load_detail`（`summary` 默认、`workouts` 附带单场明细）。
+返回结构分四块：
+
+| 部分 | 内容 |
+| --- | --- |
+| `metadata` | 方法、单位、时区、公式与参数依据、静息心率取值规则、数据范围与同步完整状态 |
+| `initialization` | 递推起始日期、初值及来源、已计算天数、是否假设用户此前没有训练 |
+| `summary` / `daily` | 最新一天与窗口内每天的负荷、CTL、ATL、TSB、`balance_end_of_day`、`ramp_rate`、运动场数与缺失情况 |
+| `activities` / `workouts` | 按运动类型拆分（仅全部运动时给出），以及按开始时间倒序的单场明细 |
+
+三种口径**分开计算、分别维护指标，不跨方法补值、不混加单位**：
+
+| 方法 | 输入 | 定位 |
+| --- | --- | --- |
+| `trimp_average` | 秒级运动时长 × 平均心率 | 默认主序列，适合历史摘要记录 |
+| `trimp_integrated` | 运动期间的心率序列积分 | 保留强度变化，作为独立序列 |
+| `device_load` | 设备上报的 `workout_load` | 展示设备口径，作为独立序列 |
+
+两个 TRIMP 都用 `TRIMP = 时长(分钟) × HRr × a × e^(b × HRr)`，`HRr = (心率 − 静息心率) / (最大心率 − 静息心率)`，
+系数 `a`、`b` 和模型来源写在 `training-load.json` 里，不按性别或年龄自动切换。积分法按每个读数的实际采样
+间隔积分，读数只在自己之后 `hr_hold_seconds` 内有效；同一时刻的重复点取排序后最后一条；心率裁剪到运动
+开始与结束之间，**结束后的恢复心率不产生负荷**。单场明细里的 `coverage` 给出所用时长、覆盖时间、未覆盖
+时间和采样条数，可以自己判断积分依据有多厚。
+
+递推用指数时间常数形式，时间常数、Ramp Rate 周期和初值都在 `training-load.json` 里，不写死在计算函数中：
+
+```
+CTL_d = CTL_{d-1} + (Load_d − CTL_{d-1})(1 − e^(−1/42))
+ATL_d = ATL_{d-1} + (Load_d − ATL_{d-1})(1 − e^(−1/7))
+TSB_d = CTL_{d-1} − ATL_{d-1}        当天训练前的状态
+Balance_d = CTL_d − ATL_d            日末平衡
+RampRate_d = CTL_d − CTL_{d−7}       不足七天为 null
+```
+
+**数据范围**：只描述已入库运动，`sync_completeness` 恒为 `unverified`。没有已入库运动的日期按已记录负荷
+为 0 参与衰减，但不声称这一天确实休息；当天标记 `provisional`，随补传更新。某场运动缺少该口径需要的
+输入时，单场 `load` 为 `null` 并给出 `reason`（`missing_average_heart_rate`、`missing_resting_heart_rate`、
+`missing_duration_seconds`、`no_heart_rate_samples`、`no_heart_rate_coverage`、`unknown_workout_span`、
+`unallocatable_span`、`missing_workout_load`、`invalid_heart_rate_range`），该天的 `load` 只作为已计算部分的
+小计、`load_status` 为 `partial`，并且**该口径当天及之后的 CTL、ATL、TSB、Ramp Rate 保持 `null`**
+（`metrics_status: blocked`，`blocked_since` 指明从哪天起）——完整日负荷无从确定时不跳过后继续输出貌似完整的
+指标。不同口径互不影响：某一场缺心率序列只挡住积分法，设备负荷和平均法照常。
+
+跨午夜时，积分法按心率所在的实际时间区间分日，平均法和设备负荷按运动墙钟区间的时间比例分日并在
+`daily_split` 里标记 `allocation: proportional`（同一天内为 `exact`）；分日后的负荷之和等于该场运动的原值。
+缺少能定出墙钟区间的信息时返回 `unallocatable_span`，不猜。
+
+静息心率取运动开始日当天的一条，当日没有则沿用最近一个更早的日期，不用全天最低心率代替；早于全部
+历史记录的日期没有可用基线，对应的两种 TRIMP 标记为不可计算。
+
+从本地最早运动日期起、以配置中明确声明的零初值递推，每次读取重算全历史，所以补传、同开始时间的修正
+和改配置都自然生效，不需要缓存失效机制；`days` 只决定返回多少天，不改变同一天的结果。`activities` 里每个
+运动类型的序列从该类型自己的首场运动起算，是它独立的 CTL/ATL，不是全身负荷的一部分。全历史没有已入库
+运动时返回 `null`。
+
+这个模型是从现有记录建立的：`initialization.assumes_no_prior_training` 恒为 `false`，零初值不代表用户
+此前没有训练，也不声称 42 天后初值的影响完全消失，`days_computed` 说明递推跑了多少天。
 
 经期配置使用上传门锁调用 `POST /cycle`，请求体包含 `enabled`、`last_start`、
 `cycle_length_days`、`cycle_period_days`，以及可选的 `last_confirmed`。关闭时发送 `{ "enabled": false }`，

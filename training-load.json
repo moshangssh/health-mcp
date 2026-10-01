@@ -1,0 +1,13 @@
+{
+  "formula": "TRIMP = 时长(分钟) × HRr × a × e^(b × HRr)，HRr = (心率 − 静息心率) / (最大心率 − 静息心率)",
+  "formula_source": "Banister 1991 TRIMP 男性系数；女性系数为 0.86 / 1.67，本文件只声明一套，不按性别自动切换",
+  "trimp_coefficient_a": 0.64,
+  "trimp_coefficient_b": 1.92,
+  "ctl_time_constant_days": 42,
+  "atl_time_constant_days": 7,
+  "ramp_rate_days": 7,
+  "initial_ctl": 0,
+  "initial_atl": 0,
+  "duration_field": "duration_seconds",
+  "hr_hold_seconds": 10
+}
