@@ -644,8 +644,8 @@ function readings(from, to, step, value) {
   return list;
 }
 
-function batteryInputs({ heartRate, workoutHeartRate = [], heartRateCoverage = [], stress = [], sleeps, restingByDate = new Map([["2026-09-01", 50], ["2026-09-02", 50]]) }) {
-  return { heartRate, workoutHeartRate, heartRateCoverage, stress, restingByDate, sleeps, observedMaxHeartRate: 0 };
+function batteryInputs({ heartRate, workoutHeartRate = [], heartRateCoverage = [], stress = [], steps = [], sleeps, restingByDate = new Map([["2026-09-01", 50], ["2026-09-02", 50]]) }) {
+  return { heartRate, workoutHeartRate, heartRateCoverage, stress, steps, restingByDate, sleeps, observedMaxHeartRate: 0 };
 }
 
 test("a calm night charges the battery, slower in its awake stages", () => {
@@ -666,18 +666,26 @@ test("a stressed night drains instead of charging", () => {
   assert.ok(walk.events.find((event) => event.type === "sleep").change < 0);
 });
 
-test("心率缺测按估算速率消耗，积分停在最后读数而不认定离腕", () => {
-  const walk = walkBodyBattery(batteryInputs({
+test("长时间无心率也无步数判为离腕并冻结，有步数活动仍按缺测消耗", () => {
+  const input = (steps) => batteryInputs({
     heartRate: [...readings(0, 60, 1, 50), [at(180), 50]],
-    stress: readings(0, 60, 10, 18),
+    stress: readings(0, 60, 10, 18), steps,
     sleeps: [{ start: at(0), end: at(60), awake: [] }],
-  }), BB_PARAMS);
+  });
+  const walk = walkBodyBattery(input([]), BB_PARAMS);
   const gap = walk.events.find((event) => event.type === "data_gap" && event.reason === "heart_rate_unavailable");
-  assert.ok(gap);
+  const unworn = walk.events.find((event) => event.type === "unworn");
+  assert.equal(gap.start, at(60) + BB_PARAMS.unworn_after_minutes * 60000);
   assert.ok(gap.change < 0);
-  assert.ok(walk.events.every((event) => event.type !== "unworn"));
-  assert.ok(walk.curve.some((point) => point.estimated), "the gap is marked estimated on the curve");
+  assert.equal(unworn.start, gap.end, "静默够久才由缺测转为离腕");
+  assert.equal(unworn.end, at(180));
+  near(unworn.change, 0);
+  assert.equal(walk.curve.at(-1).estimated, true, "前面的缺测仍标在曲线上");
   assert.equal(walk.end, at(180), "no minute past the last reading is walked");
+
+  const worn = walkBodyBattery(input(Array.from({ length: 9 }, (_, i) => [at(70 + i * 12), 30])), BB_PARAMS);
+  assert.ok(worn.events.every((event) => event.type !== "unworn"), "缺测期间有步数活动，说明仍戴着");
+  assert.ok(worn.level < walk.level, "戴着时缺测继续消耗，不像离腕那样冻结");
 });
 
 test("a heart rate reserve above the threshold drains as activity", () => {
@@ -753,9 +761,9 @@ test("缺少必需的静息心率明确失败，心率缺测估算无需基线",
     sleeps: [{ start: at(0), end: at(1), awake: [] }], restingByDate: new Map(),
   });
   assert.throws(() => walkBodyBattery(inputs, BB_PARAMS), /静息心率.*2026-09-01|2026-09-01.*静息心率/);
-  const unworn = walkBodyBattery({ ...inputs, heartRate: [] }, BB_PARAMS);
-  near(unworn.level, BB_PARAMS.initial_level - BB_PARAMS.low_intensity_drain_per_minute);
-  assert.equal(unworn.curve.at(-1).estimated, true);
+  const noHeartRate = walkBodyBattery({ ...inputs, heartRate: [] }, BB_PARAMS);
+  near(noHeartRate.level, BB_PARAMS.initial_level - BB_PARAMS.low_intensity_drain_per_minute);
+  assert.equal(noHeartRate.curve.at(-1).estimated, true);
 });
 
 test("一分钟和不足一分钟只按实际经过时长积分", () => {

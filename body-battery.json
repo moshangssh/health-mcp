@@ -11,6 +11,7 @@
   "activity_reserve_threshold": 0.3,
   "activity_drain_per_reserve": 1.2,
   "unworn_after_minutes": 15,
+  "unworn_min_minutes": 60,
   "workout_heart_rate_hold_seconds": 5,
   "stress_hold_minutes": 30,
   "high_stress_level": 60,

@@ -713,13 +713,13 @@ const MINUTE_MS = 60000;
 function readMaxHeartRate() {
   return JSON.parse(fs.readFileSync(HEART_RATE_PARAMS_PATH, "utf8")).max_heart_rate;
 }
-const BODY_BATTERY_EVENTS = ["sleep", "activity", "data_gap", "high_stress"];
+const BODY_BATTERY_EVENTS = ["sleep", "activity", "unworn", "data_gap", "high_stress"];
 
 // Only the readings the walk needs, pulled out of each day file as it is read, so a year of history
 // never sits in memory as whole records.
 function readBodyBatteryInputs(dataDir) {
   const heartRate = []; const workoutHeartRate = new Map(); const heartRateCoverage = [];
-  const stress = []; const restingByDate = new Map(); const sleeps = [];
+  const stress = []; const restingByDate = new Map(); const sleeps = []; const steps = [];
   let observedMaxHeartRate = 0;
   const files = fs.readdirSync(dataDir).filter((name) => /^\d{4}-\d{2}-\d{2}\.json$/.test(name)).sort();
   for (const name of files) {
@@ -743,6 +743,11 @@ function readBodyBatteryInputs(dataDir) {
       heartRateCoverage.push({ start: Date.parse(interval.timestamp), end: Date.parse(interval.end_time), status: interval.status });
     }
     for (const sample of record.stress?.samples || []) stress.push([Date.parse(sample.ts), sample.value]);
+    // 只有走过路才算活动证据；静止桶的零增量不进列表。
+    for (const sample of record.steps?.samples || []) {
+      const t = Date.parse(sample.ts); const value = Number(sample.value);
+      if (Number.isFinite(t) && Number.isFinite(value) && value > 0) steps.push([t, value]);
+    }
     // The day's latest resting figure stands for the whole local day (Q29).
     const resting = (record.resting_heart_rate?.samples || []).reduce((latest, sample) => (!latest || Date.parse(sample.ts) > Date.parse(latest.ts) ? sample : latest), null);
     if (resting) restingByDate.set(record.date, resting.value);
@@ -758,14 +763,15 @@ function readBodyBatteryInputs(dataDir) {
   return {
     heartRate: heartRate.sort(byTime), workoutHeartRate: [...workoutHeartRate].sort(byTime),
     heartRateCoverage: heartRateCoverage.sort((a, b) => a.start - b.start),
-    stress: stress.sort(byTime), restingByDate, sleeps: sleeps.sort((a, b) => a.start - b.start), observedMaxHeartRate,
+    stress: stress.sort(byTime), steps: steps.sort(byTime),
+    restingByDate, sleeps: sleeps.sort((a, b) => a.start - b.start), observedMaxHeartRate,
   };
 }
 
 // 从第一晚入睡积分到最后一条数据，始终计算 [t, next) 的实际时长。
 // 每分钟内再按读数、有效期和睡眠阶段边界切分，状态点表示已经积分到该时刻。
 function walkBodyBattery(inputs, params) {
-  const { heartRate, workoutHeartRate = [], heartRateCoverage = [], stress, restingByDate, sleeps } = inputs;
+  const { heartRate, workoutHeartRate = [], heartRateCoverage = [], stress, steps = [], restingByDate, sleeps } = inputs;
   const restingDates = [...restingByDate.keys()].sort();
   const wakingDates = sleeps.map((session) => formatLocalDate(new Date(session.end)));
   const start = sleeps[0].start;
@@ -773,8 +779,8 @@ function walkBodyBattery(inputs, params) {
     ...sleeps.map((session) => session.end), heartRateCoverage.reduce((latest, interval) => Math.max(latest, interval.end), 0));
   const curveMs = params.curve_interval_minutes * MINUTE_MS;
   let level = params.initial_level;
-  let hrIndex = 0; let workoutIndex = 0; let coverageIndex = 0; let stressIndex = 0; let sleepIndex = 0; let restingIndex = -1;
-  let lastHr = null; let lastWorkoutHr = null; let lastStress = null; let date = null;
+  let hrIndex = 0; let workoutIndex = 0; let coverageIndex = 0; let stressIndex = 0; let sleepIndex = 0; let restingIndex = -1; let stepIndex = 0;
+  let lastHr = null; let lastWorkoutHr = null; let lastStress = null; let lastStep = null; let silentSince = null; let date = null;
   let intervalEstimated = false;
   const estimation = { minutes: 0, charged: 0, drained: 0 };
   const contributions = {};
@@ -790,6 +796,7 @@ function walkBodyBattery(inputs, params) {
     while (coverageIndex < heartRateCoverage.length && heartRateCoverage[coverageIndex].end <= t) coverageIndex += 1;
     const coverage = heartRateCoverage[coverageIndex]?.start <= t ? heartRateCoverage[coverageIndex] : null;
     while (stressIndex < stress.length && stress[stressIndex][0] <= t) lastStress = stress[stressIndex++];
+    while (stepIndex < steps.length && steps[stepIndex][0] <= t) lastStep = steps[stepIndex++];
     while (sleepIndex < sleeps.length && sleeps[sleepIndex].end <= t) sleepIndex += 1;
     const session = sleeps[sleepIndex]?.start <= t ? sleeps[sleepIndex] : null;
     const asleep = session !== null && !session.awake.some(([from, to]) => from <= t && t < to);
@@ -799,7 +806,7 @@ function walkBodyBattery(inputs, params) {
 
     const workoutExpires = lastWorkoutHr === null ? t : lastWorkoutHr[0] + params.workout_heart_rate_hold_seconds * 1000;
     const workoutFresh = t < workoutExpires;
-    // 沿用历史配置键以兼容仍在运行的旧进程；它仅表示普通心率有效期，不证明离腕。
+    // 沿用历史配置键；它同时是普通心率有效期和步数活动的有效期，两者都过期才判离腕。
     const ordinaryExpires = lastHr === null ? t : lastHr[0] + params.unworn_after_minutes * MINUTE_MS;
     // 高频点过期后只用更新的普通点。missing 可来自智能采样间隙，不缩短普通点的有效期。
     const ordinaryFresh = lastHr !== null && t < ordinaryExpires
@@ -809,6 +816,13 @@ function walkBodyBattery(inputs, params) {
     const hrExpires = workoutFresh ? workoutExpires : ordinaryExpires;
     const stressExpires = lastStress === null ? t : lastStress[0] + params.stress_hold_minutes * MINUTE_MS;
     const stressFresh = t < stressExpires;
+    // 手环没有离腕模式：无心率读数、且阈值内也没有步数活动，两条证据都缺失。短暂的抖动不判离腕，
+    // 静默连续超过 unworn_min_minutes 才认定为未佩戴。
+    const stepExpires = lastStep === null ? t : lastStep[0] + params.unworn_after_minutes * MINUTE_MS;
+    const stepFresh = lastStep !== null && t < stepExpires;
+    const silent = !hrFresh && !stepFresh;
+    if (silent) { if (silentSince === null) silentSince = t; } else silentSince = null;
+    const unworn = silentSince !== null && t - silentSince >= params.unworn_min_minutes * MINUTE_MS;
     // 只平滑阈值附近：区间外保持原恢复/耗损速率，不整体平移高压力区的消耗。
     let pressureDelta = 0;
     if (stressFresh) {
@@ -819,7 +833,10 @@ function walkBodyBattery(inputs, params) {
     }
     const stressDrain = Math.max(0, -pressureDelta);
     let state; let delta; let gapReason = null;
-    if (!hrFresh) {
+    if (unworn) {
+      // 离腕期间电量保持不变，既不充电也不消耗，也不计入缺测估算。
+      state = "unworn"; delta = 0;
+    } else if (!hrFresh) {
       gapReason = coverage?.status === "missing" ? "heart_rate_missing" : "heart_rate_unavailable";
       state = gapReason; delta = -params.low_intensity_drain_per_minute;
     } else {
@@ -840,7 +857,7 @@ function walkBodyBattery(inputs, params) {
       }
     }
 
-    const flags = { sleep: session !== null, activity: state === "activity", data_gap: gapReason !== null, high_stress: stressFresh && lastStress[1] >= params.high_stress_level };
+    const flags = { sleep: session !== null, activity: state === "activity", unworn, data_gap: gapReason !== null, high_stress: !unworn && stressFresh && lastStress[1] >= params.high_stress_level };
     for (const type of BODY_BATTERY_EVENTS) {
       const reason = type === "data_gap" ? gapReason : null;
       if (open[type] && (!flags[type] || open[type].reason !== reason)) { close(open[type], t, level); open[type] = null; }
@@ -853,8 +870,11 @@ function walkBodyBattery(inputs, params) {
     if (coverage) next = Math.min(next, coverage.end);
     else if (coverageIndex < heartRateCoverage.length) next = Math.min(next, heartRateCoverage[coverageIndex].start);
     if (stressIndex < stress.length) next = Math.min(next, stress[stressIndex][0]);
+    if (stepIndex < steps.length) next = Math.min(next, steps[stepIndex][0]);
     if (hrFresh) next = Math.min(next, hrExpires);
     if (stressFresh) next = Math.min(next, stressExpires);
+    if (stepFresh) next = Math.min(next, stepExpires);
+    if (silent && !unworn) next = Math.min(next, silentSince + params.unworn_min_minutes * MINUTE_MS);
     if (session) {
       next = Math.min(next, session.end);
       for (const [from, to] of session.awake) {
