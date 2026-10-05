@@ -141,7 +141,8 @@ test("a stage the watch tagged as a nap reads as a nap, not as the day's night",
   const sessions = readHealthToolResult(dir, { data_type: "sleep", time_range: "today" }).recent_sleep_list;
   const nap = sessions.find((session) => session.start === "9/6 11:00");
   assert.equal(nap.type, "nap");
-  assert.deepEqual(Object.keys(nap).sort(), ["duration_text", "end", "start", "total_minutes", "type"], "a nap carries no night's stage minutes");
+  assert.deepEqual(Object.keys(nap).sort(), ["duration_text", "end", "end_at", "start", "start_at", "total_minutes", "type"], "a nap carries no night's stage minutes");
+  assert.equal(nap.start_at, "2026-09-06T03:00:00.000Z", "the clock reading is local; the instant beside it is absolute");
   const night = sessions.find((session) => session.start === "9/6 00:00");
   assert.equal(night.type, "sleep");
   assert.equal(night.deep_sleep_minutes, 360);
@@ -192,20 +193,160 @@ test("a night reports the time it spent awake, which only its own stages know", 
   assert.equal(night.end, "9/6 08:20", "the span still covers the waking, so both figures read together");
 });
 
-test("a night with no stages reads its minutes off the day's own fields", (t) => {
+test("a night the day holds whole reads its minutes off its own block", (t) => {
   freezeClock(t);
   const dir = tmpDataDir();
+  // The old whole-night upload: one object, no sessions stored beside it, so record.sleep is this
+  // night itself and its fields are the night's own.
   mergeHealthData(dir, {
     date: "2026-09-06",
     type: "sleep",
     data: { duration_min: 480, deep_min: 180, light_min: 260, rem_min: 40, awake_min: 25, start: "2026-09-06T00:00:00+08:00", end: "2026-09-06T08:25:00+08:00" },
   });
+  assert.equal(readDay(dir, "2026-09-06").sleep_sessions, undefined, "the block path stores no sessions of its own");
 
   const [night] = readHealthToolResult(dir, { data_type: "sleep", time_range: "today" }).recent_sleep_list;
   assert.equal(night.type, "sleep");
-  assert.equal(night.awake_minutes, 25);
+  assert.equal(night.total_minutes, 480);
+  assert.equal(night.awake_minutes, 25, "with no separate sessions the day's fields are this night's");
   assert.equal(night.deep_sleep_minutes, 180);
   assert.equal(night.rem_sleep_minutes, 40);
+});
+
+test("a stage-less session beside an independent one reports no minutes of its own", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  mergeHealthData(dir, {
+    date: "2026-09-06",
+    sleep: [
+      { session_start_time: "2026-09-06T00:00:00+08:00", session_end_time: "2026-09-06T08:00:00+08:00", duration_seconds: 28800, stages: [] },
+      {
+        session_start_time: "2026-09-06T13:00:00+08:00",
+        session_end_time: "2026-09-06T14:00:00+08:00",
+        duration_seconds: 3600,
+        stages: [{ stage: "light", start_time: "2026-09-06T13:00:00+08:00", end_time: "2026-09-06T14:00:00+08:00", duration_seconds: 3600 }],
+      },
+    ],
+  });
+  assert.equal(readDay(dir, "2026-09-06").sleep.light_min, 60, "the day's light minutes belong to the afternoon session");
+
+  const night = readHealthToolResult(dir, { data_type: "sleep", time_range: "today" }).recent_sleep_list.find((session) => session.start === "9/6 00:00");
+  assert.equal(night.total_minutes, 480, "the span is still the session's own");
+  assert.equal(night.light_sleep_minutes, null, "the day's 60 minutes are not this night's");
+  assert.equal(night.deep_sleep_minutes, null);
+  assert.equal(night.awake_minutes, null);
+});
+
+test("a nap's minutes do not stand in for a stage-less night's", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  mergeHealthData(dir, {
+    date: "2026-09-06",
+    sleep: [
+      { session_start_time: "2026-09-06T00:00:00+08:00", session_end_time: "2026-09-06T08:00:00+08:00", duration_seconds: 28800, stages: [] },
+      {
+        session_start_time: "2026-09-06T11:00:00+08:00",
+        session_end_time: "2026-09-06T11:10:00+08:00",
+        duration_seconds: 600,
+        stages: [{ stage: "awake", start_time: "2026-09-06T11:00:00+08:00", end_time: "2026-09-06T11:10:00+08:00", duration_seconds: 600 }],
+      },
+    ],
+  });
+
+  const record = readDay(dir, "2026-09-06");
+  assert.equal(record.sleep.awake_min, 10, "the day's awake minutes are the nap's, the night's being unsaid");
+
+  const sessions = readHealthToolResult(dir, { data_type: "sleep", time_range: "today" }).recent_sleep_list;
+  assert.equal(sessions.find((session) => session.start === "9/6 11:00").type, "nap");
+  assert.equal(sessions.find((session) => session.start === "9/6 00:00").awake_minutes, null, "the day's total is not the night's");
+});
+
+test("a read carries the time of the last upload the server saw", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  assert.equal(readHealthToolResult(dir, { data_type: "daily_summary" }).last_ingest_at, null, "a server that has heard nothing says so");
+
+  mergeHealthData(dir, { date: "2026-09-06", steps: { total: 1000 } });
+  assert.equal(readHealthToolResult(dir, { data_type: "daily_summary", time_range: "today" }).last_ingest_at, FROZEN_NOW.toISOString());
+
+  // 白天断联：最后一次上传停在那一刻，read 的答案也就停在哪一刻。
+  mock.timers.setTime(FROZEN_NOW.getTime() + 4 * 3600 * 1000);
+  assert.equal(readHealthToolResult(dir, { data_type: "daily_summary", time_range: "today" }).last_ingest_at, FROZEN_NOW.toISOString());
+});
+
+test("an upload that only touches a list, the coverage or the profile still stamps the time", (t) => {
+  freezeClock(t);
+  // 这几条写入路径一个 updatedAt 都不写，戳必须由写入侧记下，读端才推断得出来。
+  const bodies = {
+    workouts: [{ timestamp: "2026-09-06T07:30:00+08:00", activity: "running", end_time: "2026-09-06T08:05:00+08:00", duration_seconds: 2100 }],
+    sleep_stats: [{ timestamp: "2026-09-06T07:00:00+08:00", sleep_score: 88 }],
+    heart_rate_coverage: [{ timestamp: "2026-09-06T00:00:00+08:00", end_time: "2026-09-06T01:00:00+08:00", status: "observed" }],
+    profile: { height_cm: 175, weight_kg: 70, age: 36, gender: "male", birthday: "1990-05-01" },
+  };
+  for (const [key, value] of Object.entries(bodies)) {
+    const dir = tmpDataDir();
+    mergeHealthData(dir, { date: "2026-09-06", [key]: value });
+    assert.equal(readDay(dir, "2026-09-06").ingestedAt, FROZEN_NOW.toISOString(), `${key}: the write path leaves the stamp`);
+    assert.equal(readHealthToolResult(dir, { data_type: "daily_summary", time_range: "today" }).last_ingest_at, FROZEN_NOW.toISOString(), key);
+  }
+});
+
+test("the last upload time follows the newest upload in the window", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  mergeHealthData(dir, { date: "2026-09-05", steps: { total: 1000 } });
+  mergeHealthData(dir, { date: "2026-09-06", steps: { total: 2000 } });
+  assert.equal(readHealthToolResult(dir, { data_type: "daily_summary", days: 3 }).last_ingest_at, FROZEN_NOW.toISOString());
+
+  const later = new Date(FROZEN_NOW.getTime() + 3600 * 1000).toISOString();
+  mock.timers.setTime(FROZEN_NOW.getTime() + 3600 * 1000);
+  mergeHealthData(dir, { date: "2026-09-06", steps: { total: 3000 } });
+  assert.equal(readHealthToolResult(dir, { data_type: "daily_summary", days: 3 }).last_ingest_at, later, "the newest upload wins");
+});
+
+test("a night that lands on another day's file stamps that file too", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  // The night ends 2026-09-02, so it is stored under that date even though the body says 09-06.
+  mergeHealthData(dir, { date: "2026-09-06", sleep: [night(7, 8)] });
+  assert.equal(readDay(dir, "2026-09-02").ingestedAt, FROZEN_NOW.toISOString(), "the file the night landed in carries the stamp");
+  assert.equal(fs.existsSync(path.join(dir, "2026-09-05.json")), false, "a day nothing landed in is not created");
+});
+
+test("every read type carries the last-upload time", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  mergeHealthData(dir, { date: "2026-09-06", steps: { total: 1000 } });
+
+  for (const data_type of ["current_status", "steps", "heart_rate", "sleep", "workouts", "daily_summary", "series", "body_battery", "training_load", "all"]) {
+    assert.equal(readHealthToolResult(dir, { data_type }).last_ingest_at, FROZEN_NOW.toISOString(), data_type);
+  }
+});
+
+test("the daily summary's sleep keeps when the night landed and its span", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  mergeHealthData(dir, { date: "2026-09-02", sleep: [night(7, 8)] });
+
+  const day = readHealthToolResult(dir, { data_type: "daily_summary", days: 10 }).summaries.find((summary) => summary.date === "2026-09-02");
+  assert.equal(day.sleep.updated_at, FROZEN_NOW.toISOString(), "the night's data says when it arrived");
+  assert.equal(day.sleep.start, "2026-09-01T15:00:00.000Z");
+  assert.equal(day.sleep.end, "2026-09-01T23:00:00.000Z");
+
+  const empty = readHealthToolResult(tmpDataDir(), { data_type: "daily_summary", time_range: "today" }).summaries;
+  assert.deepEqual(empty, [], "a day with no file has no summary at all");
+});
+
+test("a session carries the absolute instant beside the local clock", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  mergeHealthData(dir, { date: "2026-09-02", sleep: [night(7, 8)] });
+
+  const [session] = readHealthToolResult(dir, { data_type: "sleep", days: 10 }).recent_sleep_list;
+  assert.equal(session.start, "9/1 23:00", "the human clock reading is unchanged");
+  assert.equal(session.end, "9/2 07:00");
+  assert.equal(session.start_at, "2026-09-01T15:00:00.000Z");
+  assert.equal(session.end_at, "2026-09-01T23:00:00.000Z");
 });
 
 test("a sleep read carries the watch's own report for each night", (t) => {

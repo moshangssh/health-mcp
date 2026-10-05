@@ -267,6 +267,8 @@ function mergeSleepSessionsForDate(dataDir, date, incoming, updatedAt) {
   for (const session of incoming) upsertSleepSession(sessions, session);
   record.sleep_sessions = sessions.sort((a, b) => a.end.localeCompare(b.end));
   record.sleep = summarizeSleepSessions(record.sleep_sessions, updatedAt);
+  // 这一夜跨日落在别的日文件上时，那个文件也要留下这次上传的时刻。
+  record.ingestedAt = updatedAt;
   writeRecordAtomic(filePath, record);
   return record;
 }
@@ -582,6 +584,9 @@ function mergeHealthData(dataDir, body) {
     };
   }
 
+  // 这次上传的到达时刻，由写入侧记下：只带 workouts、sleep_stats、profile、heart_rate_coverage
+  // 的上传不碰任何 updatedAt，读端推断不出来，这里落一个直接的戳。
+  current.ingestedAt = now;
   writeRecordAtomic(filePath, current);
   return current;
 }
@@ -657,8 +662,18 @@ function dailySummary(record) {
       light_min: nullableNumber(record.sleep.light_min), rem_min: nullableNumber(record.sleep.rem_min),
       awake_min: nullableNumber(record.sleep.awake_min), nap_min: nullableNumber(record.sleep.nap_min),
       score: nullableNumber(record.sleep.score),
+      start: record.sleep.start || null, end: record.sleep.end || null, updated_at: record.sleep.updatedAt || null,
     } : null,
   };
+}
+
+// 服务端最后一次收到上传的时刻，是写入侧在落盘时直接记下的事实（mergeHealthData /
+// mergeSleepSessionsForDate），读端只取窗口内最新的一个，不再从各指标的 updatedAt 去推断——
+// 只带 workouts、sleep_stats、profile、heart_rate_coverage 的上传不写任何 updatedAt。
+// 本字段之前写下的旧文件没有 ingestedAt，在该日首次收到数据前会是 null。
+function lastIngestAt(records) {
+  const stamps = records.map((record) => record.ingestedAt).filter((stamp) => typeof stamp === "string");
+  return stamps.length ? stamps.sort().at(-1) : null;
 }
 
 function formatLocalClock(value) {
@@ -668,7 +683,10 @@ function formatLocalClock(value) {
   return `${parts.month}/${parts.day} ${parts.hour}:${parts.minute}`;
 }
 
-function sleepSession(record, session) {
+// `hasOwnSessions` 说的是这一天有没有独立存下来的 sleep_sessions。有的话 record.sleep 是它们的
+// 合计（含午睡），无 stages 的 session 无从知道自己的阶段，只能报未知；没有的话 record.sleep 就是
+// 这一夜本身（旧版把整夜当一个对象上传的那条路径），它的阶段值正是这一夜的，直接读。
+function sleepSession(record, session, hasOwnSessions) {
   const stages = Array.isArray(session.stages) ? session.stages : [];
   const stageMinutes = (names) => stages.reduce((total, stage) => String(stage.stage ?? "").toLowerCase() && names.some((name) => String(stage.stage ?? "").toLowerCase() === name || String(stage.stage ?? "").toLowerCase().includes(name)) ? total + Math.round(Number(stage.duration_seconds || 0) / 60) : total, 0);
   const deep = stageMinutes(["5", "deep"]); const light = stageMinutes(["4", "light"]); const rem = stageMinutes(["6", "rem"]); const awake = stageMinutes(["1", "3", "7", "awake", "out_of_bed"]);
@@ -679,19 +697,26 @@ function sleepSession(record, session) {
   // awake. A nap reports no deep, light or rem of its own, and the day's totals must not stand in
   // for them, or the whole night's stages would be read back as this nap's.
   const isNap = nap > 0 || (awake > 0 && deep === 0 && light === 0 && rem === 0);
-  const result = { type: isNap ? "nap" : "sleep", start: formatLocalClock(session.start), end: formatLocalClock(session.end), total_minutes: duration, duration_text: `${Math.floor(duration / 60)}h ${duration % 60}min` };
+  const toIso = (value) => Number.isNaN(new Date(value || "").getTime()) ? null : new Date(value).toISOString();
+  const result = { type: isNap ? "nap" : "sleep", start: formatLocalClock(session.start), end: formatLocalClock(session.end), start_at: toIso(session.start), end_at: toIso(session.end), total_minutes: duration, duration_text: `${Math.floor(duration / 60)}h ${duration % 60}min` };
   if (isNap) return result;
   // A session that carries stages is summed from them — a zero here is the watch saying it spent no
-  // time in that stage tonight, never another session's figure standing in. The awake minutes are
-  // what only a session can give: the summary has them by the day, and the day is not the night.
-  if (!stages.length) return Object.assign(result, { deep_sleep_minutes: nullableNumber(record?.sleep?.deep_min) || 0, light_sleep_minutes: nullableNumber(record?.sleep?.light_min) || 0, rem_sleep_minutes: nullableNumber(record?.sleep?.rem_min) || 0, awake_minutes: nullableNumber(record?.sleep?.awake_min) || 0 });
+  // time in that stage tonight, never another session's figure standing in. A session without
+  // stages can only be read off the day's own fields when the day holds no separate sessions, so
+  // record.sleep is this night itself; where separate sessions exist, record.sleep is their total
+  // — naps included — and the minutes read as unknown rather than as that total.
+  if (!stages.length) return hasOwnSessions
+    ? Object.assign(result, { deep_sleep_minutes: null, light_sleep_minutes: null, rem_sleep_minutes: null, awake_minutes: null })
+    : Object.assign(result, { deep_sleep_minutes: nullableNumber(record?.sleep?.deep_min) || 0, light_sleep_minutes: nullableNumber(record?.sleep?.light_min) || 0, rem_sleep_minutes: nullableNumber(record?.sleep?.rem_min) || 0, awake_minutes: nullableNumber(record?.sleep?.awake_min) || 0 });
   return Object.assign(result, { deep_sleep_minutes: deep, light_sleep_minutes: light, rem_sleep_minutes: rem, awake_minutes: awake });
 }
 
 function sleepSessions(records) {
   return records.flatMap((record) => {
-    const sessions = Array.isArray(record.sleep_sessions) && record.sleep_sessions.length ? record.sleep_sessions : (record.sleep?.start || record.sleep?.end ? [record.sleep] : []);
-    return sessions.map((session) => ({ session: sleepSession(record, session), end: new Date(session.end || "").getTime() }));
+    // 有独立 session 时 record.sleep 只是合计；没有时这个 fallback 把 record.sleep 自己当那一夜。
+    const hasOwnSessions = Array.isArray(record.sleep_sessions) && record.sleep_sessions.length > 0;
+    const sessions = hasOwnSessions ? record.sleep_sessions : (record.sleep?.start || record.sleep?.end ? [record.sleep] : []);
+    return sessions.map((session) => ({ session: sleepSession(record, session, hasOwnSessions), end: new Date(session.end || "").getTime() }));
   }).sort((a, b) => b.end - a.end).map(({ session }) => session);
 }
 
@@ -1200,7 +1225,7 @@ function readHealthToolResult(dataDir, args = {}) {
   const summaries = records.map(dailySummary).sort((a, b) => a.date.localeCompare(b.date));
   const todayRecord = records.find((record) => record.date === today) || {};
   const sleep = sleepSessions(records);
-  const resultBase = { success: true, data_type: dataType };
+  const resultBase = { success: true, data_type: dataType, last_ingest_at: lastIngestAt(records) };
   // The profile describes the person, not the day, so it is attached once to every answer rather
   // than repeated per day summary.
   const profile = readProfile(dataDir);
