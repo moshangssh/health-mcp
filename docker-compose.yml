@@ -12,6 +12,8 @@ services:
       - ./heart-rate.json:/app/heart-rate.json:ro
       # 训练负荷公式系数与时间常数
       - ./training-load.json:/app/training-load.json:ro
+      # 夜醒通知的时长阈值与等待时长
+      - ./wake-notify.json:/app/wake-notify.json:ro
     # 只绑宿主机回环，公网入口交给 Caddy/Nginx/Tunnel
     ports:
       - "127.0.0.1:${HEALTH_MCP_PORT}:${HEALTH_MCP_PORT}"

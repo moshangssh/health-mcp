@@ -258,6 +258,123 @@ test("a file left duplicated by the old merge heals on the next upload", () => {
   assert.equal(record.sleep.duration_min, 480);
 });
 
+// 23:00–07:00（+08:00）的一夜，中间一段 `awakeMinutes` 的清醒，之后接着睡回去；`tail` 让清醒落在末尾，
+// 也就是天亮那次起床。
+function nightWithWaking(awakeMinutes, { awakeAt = "2026-09-01T17:00:00Z", tail = false } = {}) {
+  const awakeEnd = new Date(Date.parse(awakeAt) + awakeMinutes * 60000).toISOString();
+  const stages = [
+    { stage: "light", start_time: "2026-09-01T15:00:00Z", end_time: awakeAt, duration_seconds: (Date.parse(awakeAt) - Date.parse("2026-09-01T15:00:00Z")) / 1000 },
+    { stage: "awake", start_time: awakeAt, end_time: awakeEnd, duration_seconds: awakeMinutes * 60 },
+  ];
+  if (!tail) stages.push({ stage: "light", start_time: awakeEnd, end_time: "2026-09-01T23:00:00Z", duration_seconds: (Date.parse("2026-09-01T23:00:00Z") - Date.parse(awakeEnd)) / 1000 });
+  return { session_start_time: "2026-09-01T15:00:00Z", session_end_time: "2026-09-01T23:00:00Z", duration_seconds: 28800, stages };
+}
+
+function readWakeEvents(dir) {
+  return JSON.parse(fs.readFileSync(path.join(dir, "wake-events.json"), "utf8")).events;
+}
+
+async function connectHealthMcp(dir) {
+  const server = createHealthMcpServer(dir);
+  const client = new Client({ name: "wake-notify-test", version: "1" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  return { client, server };
+}
+
+async function callWaitForWake(client, args) {
+  return JSON.parse((await client.callTool({ name: "health_wait_for_wake", arguments: args })).content[0].text);
+}
+
+test("a night waking is recorded once, and re-sending the night does not make it new again", () => {
+  const dir = tmpDataDir();
+  mergeHealthData(dir, { sleep: [nightWithWaking(10)] });
+  const first = readWakeEvents(dir);
+  assert.deepEqual(first.map(({ seq, night, start, end, awake_minutes }) => ({ seq, night, start, end, awake_minutes })), [
+    { seq: 1, night: "2026-09-02", start: "2026-09-01T17:00:00.000Z", end: "2026-09-01T17:10:00.000Z", awake_minutes: 10 },
+  ]);
+
+  mergeHealthData(dir, { sleep: [nightWithWaking(10)] });
+  const second = readWakeEvents(dir);
+  assert.equal(second.length, 1, "the same waking must not be read as a new one");
+  assert.equal(second[0].seq, 1);
+  assert.equal(second[0].received_at, first[0].received_at);
+});
+
+test("a night restated without its waking drops the event it used to have", () => {
+  const dir = tmpDataDir();
+  mergeHealthData(dir, { sleep: [nightWithWaking(10)] });
+  const restated = nightWithWaking(10);
+  restated.stages[1] = { ...restated.stages[1], stage: "light" };
+  mergeHealthData(dir, { sleep: [restated] });
+  assert.deepEqual(readWakeEvents(dir), []);
+});
+
+test("an awake stretch under the threshold is kept but never handed out", async () => {
+  const dir = tmpDataDir();
+  mergeHealthData(dir, { sleep: [nightWithWaking(3)] });
+  assert.equal(readWakeEvents(dir).length, 1, "the threshold is applied on read, so it stays in the store");
+
+  const { client, server } = await connectHealthMcp(dir);
+  assert.deepEqual(await callWaitForWake(client, { since: 0, timeout_seconds: 0 }), { timed_out: true, since: 0, next_since: 0, events: [] });
+  await client.close();
+  await server.close();
+});
+
+test("the morning wake-up, and a nap, are not night wakings", async () => {
+  const dir = tmpDataDir();
+  mergeHealthData(dir, { sleep: [nightWithWaking(10, { tail: true })] });
+  mergeHealthData(dir, {
+    date: "2026-09-02",
+    sleep: [{
+      session_start_time: "2026-09-02T11:00:00+08:00",
+      session_end_time: "2026-09-02T13:00:00+08:00",
+      duration_seconds: 7200,
+      stages: [
+        { stage: "nap", start_time: "2026-09-02T11:00:00+08:00", end_time: "2026-09-02T11:30:00+08:00", duration_seconds: 1800 },
+        { stage: "light", start_time: "2026-09-02T11:30:00+08:00", end_time: "2026-09-02T12:00:00+08:00", duration_seconds: 1800 },
+        { stage: "awake", start_time: "2026-09-02T12:00:00+08:00", end_time: "2026-09-02T12:10:00+08:00", duration_seconds: 600 },
+        { stage: "light", start_time: "2026-09-02T12:10:00+08:00", end_time: "2026-09-02T13:00:00+08:00", duration_seconds: 3000 },
+      ],
+    }],
+  });
+
+  const { client, server } = await connectHealthMcp(dir);
+  assert.deepEqual((await callWaitForWake(client, { since: 0, timeout_seconds: 0 })).events, []);
+  await client.close();
+  await server.close();
+});
+
+test("health_wait_for_wake returns as soon as the night's data lands", async () => {
+  const dir = tmpDataDir();
+  const { client, server } = await connectHealthMcp(dir);
+  const pending = client.callTool({ name: "health_wait_for_wake", arguments: { since: 0, timeout_seconds: 10 } });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  mergeHealthData(dir, { sleep: [nightWithWaking(10)] });
+
+  const result = JSON.parse((await pending).content[0].text);
+  assert.equal(result.timed_out, false);
+  assert.deepEqual(result.events.map((event) => event.awake_minutes), [10]);
+  assert.equal(result.next_since, 1);
+  await client.close();
+  await server.close();
+});
+
+test("a call with no since waits for what arrives next, and next_since carries the cursor on", async () => {
+  const dir = tmpDataDir();
+  mergeHealthData(dir, { sleep: [nightWithWaking(10)] });
+  const { client, server } = await connectHealthMcp(dir);
+  assert.deepEqual(await callWaitForWake(client, { timeout_seconds: 0 }), { timed_out: true, since: 1, next_since: 1, events: [] }, "an event already in the store is not new");
+
+  mergeHealthData(dir, { sleep: [nightWithWaking(12, { awakeAt: "2026-09-01T19:00:00Z" })] });
+  const caught = await callWaitForWake(client, { since: 1, timeout_seconds: 0 });
+  assert.equal(caught.timed_out, false);
+  assert.deepEqual(caught.events.map(({ seq, awake_minutes }) => ({ seq, awake_minutes })), [{ seq: 2, awake_minutes: 12 }]);
+  await client.close();
+  await server.close();
+});
+
 test("MCP exposes the public health read contract and custom day ranges", async (t) => {
   freezeClock(t);
   const dir = tmpDataDir();
@@ -277,7 +394,7 @@ test("MCP exposes the public health read contract and custom day ranges", async 
   await server.connect(serverTransport);
   await client.connect(clientTransport);
   const tools = await client.listTools();
-  assert.deepEqual(tools.tools.map((tool) => tool.name), ["health_read"]);
+  assert.deepEqual(tools.tools.map((tool) => tool.name), ["health_read", "health_wait_for_wake"]);
   assert.deepEqual(Object.keys(tools.tools[0].inputSchema.properties), ["data_type", "time_range", "heart_rate_detail", "training_load_detail", "method", "activity", "days"]);
   const steps = JSON.parse((await client.callTool({ name: "health_read", arguments: { data_type: "steps", days: 5 } })).content[0].text);
   assert.equal(steps.summaries.length, 5);

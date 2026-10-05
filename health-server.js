@@ -271,6 +271,101 @@ function mergeSleepSessionsForDate(dataDir, date, incoming, updatedAt) {
   return record;
 }
 
+// 夜醒通知：睡眠阶段随 App 每次同步上传——后台按小时、解锁屏幕后立刻一次——所以夜里的清醒时段
+// 当晚就能到服务器。MCP 客户端都是自己发起请求的拉取方，服务端把见过的夜醒事件记在
+// wake-events.json 里，谁问就给谁；health_wait_for_wake 把请求挂住直到事件到达，于是拉取就成了推送。
+// 阈值和等待时长在项目根目录的 wake-notify.json 里，每次调用重新读取。
+const WAKE_NOTIFY_PARAMS_PATH = path.join(__dirname, "wake-notify.json");
+
+function readWakeNotifyParams() {
+  return JSON.parse(fs.readFileSync(WAKE_NOTIFY_PARAMS_PATH, "utf8"));
+}
+
+function wakeEventsPath(dataDir) { return path.join(ensureDataDir(dataDir), "wake-events.json"); }
+
+function readWakeEventStore(dataDir) {
+  return readRecord(wakeEventsPath(dataDir), { events: [] });
+}
+
+function sleepStageSeconds(stages, keys) {
+  return stages.reduce((total, stage) => keys.has(sleepStageMetricKey(stage.stage)) ? total + Number(stage.duration_seconds || 0) : total, 0);
+}
+
+const SLEEPING_MIN_KEYS = new Set(["deep_min", "light_min", "rem_min"]);
+
+function sleepSessionNight(session) { return formatLocalDate(new Date(session.end)); }
+
+// 夜醒 = 一夜的睡眠里头、后面还接着睡眠的清醒时段。收尾那次醒来是起床不是夜醒，小睡也不算
+// （它整段都是清醒推断出来的，本就没有「夜里」可言）。时长阈值不在这里判，留给读取时按当时的
+// wake-notify.json 过滤，改了阈值对全部历史立刻生效。
+function wakeEventsForSession(session) {
+  const stages = Array.isArray(session.stages) ? session.stages : [];
+  if (sleepStageSeconds(stages, SLEEPING_MIN_KEYS) === 0) return [];
+  if (sleepStageSeconds(stages, new Set(["nap_min"])) > 0) return [];
+  const night = sleepSessionNight(session);
+  const events = [];
+  for (let index = 0; index < stages.length; index += 1) {
+    const stage = stages[index];
+    if (sleepStageMetricKey(stage.stage) !== "awake_min") continue;
+    const sleptAgain = stages.slice(index + 1).some((later) => SLEEPING_MIN_KEYS.has(sleepStageMetricKey(later.stage)));
+    if (!sleptAgain) continue;
+    events.push({
+      id: `${night}|${stage.start}`,
+      night,
+      start: stage.start,
+      end: stage.end,
+      awake_minutes: Math.round(Number(stage.duration_seconds || 0) / 60),
+    });
+  }
+  return events;
+}
+
+// 见过的事件不重发：同一夜每次同步都会重传，重传不是新的夜醒。首次见到的时间就是它的 received_at，
+// seq 也一并保留，所以客户端带上次的 next_since 回来，只会拿到此后新收到的事件——同一次上传里的
+// 多条也不会漏。这次上传碰到的夜以落盘结果为准，被修正掉的那条不留影子；别的夜原样不动。
+function recordWakeEvents(dataDir, sessions, receivedAt) {
+  const filePath = wakeEventsPath(dataDir);
+  const store = readWakeEventStore(dataDir);
+  const nights = new Set(sessions.map(sleepSessionNight));
+  const events = store.events.filter((event) => !nights.has(event.night));
+  const priorById = new Map(store.events.filter((event) => nights.has(event.night)).map((event) => [event.id, event]));
+  let seq = store.events.reduce((max, event) => Math.max(max, event.seq), 0);
+  let changed = events.length !== store.events.length;
+  for (const event of sessions.flatMap((session) => wakeEventsForSession(session))) {
+    const prior = priorById.get(event.id);
+    if (prior) {
+      events.push(prior);
+      priorById.delete(event.id);
+      continue;
+    }
+    seq += 1;
+    events.push({ ...event, seq, received_at: receivedAt });
+    changed = true;
+  }
+  if (!changed) return;
+  writeRecordAtomic(filePath, { events: events.sort((a, b) => a.seq - b.seq) });
+}
+
+function wakeEventCursor(dataDir) {
+  return readWakeEventStore(dataDir).events.reduce((max, event) => Math.max(max, event.seq), 0);
+}
+
+// 轮询文件而不是等进程内事件：上传端和 MCP server 谁先谁后、服务重启过几次，都不影响结果，
+// 事件一旦落盘就有定论。
+async function waitForWakeEvents(dataDir, { since, timeoutSeconds, pollIntervalSeconds }) {
+  const params = readWakeNotifyParams();
+  const cursor = since === undefined ? wakeEventCursor(dataDir) : since;
+  const deadline = Date.now() + timeoutSeconds * 1000;
+  for (;;) {
+    const events = readWakeEventStore(dataDir).events
+      .filter((event) => event.seq > cursor && event.awake_minutes >= params.min_awake_minutes);
+    if (events.length) return { timed_out: false, since: cursor, next_since: events[events.length - 1].seq, events };
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return { timed_out: true, since: cursor, next_since: cursor, events: [] };
+    await new Promise((resolve) => setTimeout(resolve, Math.min(pollIntervalSeconds * 1000, remainingMs)));
+  }
+}
+
 function round1(value) {
   return Math.round(value * 10) / 10;
 }
@@ -367,9 +462,13 @@ function mergeHealthData(dataDir, body) {
       if (!sleepSessionsByDate.has(sessionDate)) sleepSessionsByDate.set(sessionDate, []);
       sleepSessionsByDate.get(sessionDate).push(session);
     }
+    const storedSessions = [];
     for (const [sessionDate, sessions] of sleepSessionsByDate) {
-      mergeSleepSessionsForDate(dataDir, sessionDate, sessions, now);
+      const merged = mergeSleepSessionsForDate(dataDir, sessionDate, sessions, now);
+      storedSessions.push(...merged.sleep_sessions);
     }
+    // 从落盘后的会话推导，而不是从这次上传的原文：合并规则可能保留了更完整的那一版。
+    recordWakeEvents(dataDir, storedSessions, now);
     if (sleepSessionsByDate.has(date)) {
       current = readRecord(filePath, current);
     } else if (current.sleep?.end) {
@@ -1159,6 +1258,23 @@ function createHealthMcpServer(dataDir) {
   }, async (args) => ({
     content: [{ type: "text", text: JSON.stringify(readHealthToolResult(dataDir, args), null, 2) }],
   }));
+  server.tool(
+    "health_wait_for_wake",
+    "等待新的「睡眠中醒来」事件：夜里睡着后又醒、之后接着睡回去的时段，清醒时长达到 wake-notify.json 里的阈值（收尾那次起床不算，小睡不算）。手机把睡眠数据传上来时事件入库，后台按小时、每次解锁屏幕都会同步，所以半夜醒来通常几秒到一小时内到达。请求会一直挂到事件到达或超时。不传 since 表示只等这次调用之后新收到的事件；把上次返回的 next_since 传回来，可以补上断开期间收到的事件，不重不漏。",
+    {
+      since: z.number().int().min(0).optional(),
+      timeout_seconds: z.number().int().min(0).optional(),
+    },
+    async (args) => {
+      const params = readWakeNotifyParams();
+      const result = await waitForWakeEvents(dataDir, {
+        since: args.since,
+        timeoutSeconds: args.timeout_seconds ?? params.default_wait_seconds,
+        pollIntervalSeconds: params.poll_interval_seconds,
+      });
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
   return server;
 }
 

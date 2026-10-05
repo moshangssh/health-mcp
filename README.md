@@ -53,7 +53,7 @@ curl http://127.0.0.1:3100/healthz   # 返回 {"ok":true,...}
 
 ## MCP 工具
 
-服务只暴露一个 `health_read` 工具：
+服务暴露两个工具：读取的 `health_read`，和等待夜醒的 `health_wait_for_wake`（见本节末尾）。先看 `health_read`：
 
 - `data_type`：`current_status`、`steps`、`heart_rate`、`sleep`、`workouts`、`daily_summary`、`series`、`body_battery`、`training_load`、`all`
 - `time_range`：`today` 或 `three_days`
@@ -149,7 +149,8 @@ curl http://127.0.0.1:3100/healthz   # 返回 {"ok":true,...}
 最大心率（默认 190）在 [`heart-rate.json`](heart-rate.json) 里，身体电量和训练负荷共用同一个值，
 两个算法不各存一份；`body_battery` 输出的 `max_heart_rate_setting` 和 `training_load` 的
 `metadata.parameters.max_heart_rate` 都来自这里。训练负荷的公式系数、时间常数与采样规则在
-[`training-load.json`](training-load.json) 里，同样是每次调用重新读取。三个参数文件在容器里都挂了只读卷，
+[`training-load.json`](training-load.json) 里，同样是每次调用重新读取。夜醒通知的时长阈值与等待时长在
+[`wake-notify.json`](wake-notify.json) 里，同样每次调用重新读取。四个参数文件在容器里都挂了只读卷，
 改完不用重启、也不用重建镜像。
 
 `training_load` 返回训练负荷：由已入库运动算出的每日负荷，以及在该负荷上按指数时间常数递推的
@@ -222,6 +223,23 @@ body 里，服务端收到后提到独立的 `profile.json`，读取时挂在结
 
 MCP 入口 `https://你的域名/mcp`（Streamable HTTP）。若设了读取 token，客户端请求头需加 `Authorization: Bearer <读取token>`。
 
+### health_wait_for_wake
+
+`health_wait_for_wake` 用来等**夜醒**：同一夜里先有睡眠、中间一段清醒、之后还有睡眠，清醒时长达到
+[`wake-notify.json`](wake-notify.json) 里的 `min_awake_minutes`（默认 5 分钟）。天亮那次收尾的醒来是起床，
+不算；小睡也不算。事件在手机把睡眠数据传上来时入库——后台按小时、每次解锁屏幕也同步一次——所以
+半夜醒来通常几秒到一小时内到达。请求一直挂到事件到达或超时，于是「拉取」在客户端看来就是「推送」，
+不需要客户端支持服务端主动通知（Streamable HTTP 入口只收 POST，本来也没有推送通道）。
+
+参数只有两个：`since`（整数游标，可选）和 `timeout_seconds`（可选，默认 `default_wait_seconds`）。
+不传 `since` 表示只等这次调用之后新收到的事件；把上次返回的 `next_since` 传回来，就能取到断开期间
+积累的事件。同一夜重传不会重复，同一次上传里的多条也不会漏。返回 `timed_out`、`events` 和 `next_since`，
+事件带 `night`（属于哪一夜）、`start`/`end`（那段清醒的起止，ISO）、`awake_minutes`、`received_at`。
+
+同一夜每次同步都会整段重传，服务端按事件自身的起止去重，只认第一次见到的时间；被修正掉的那条
+（这一夜重传后已经没有它）会随之消失。事件存在 `<HEALTH_DATA_DIR>/wake-events.json`，服务重启和客户端
+断开都不影响。阈值在读取时生效，所以改完立刻对全部历史有效；`poll_interval_seconds` 是等待时的轮询间隔。
+
 ## 数据
 
 按天落盘为 `<HEALTH_DATA_DIR>/YYYY-MM-DD.json`。新 App 上传一分钟步数并带 `steps_bucket_seconds: 60`，
@@ -230,7 +248,7 @@ MCP 入口 `https://你的域名/mcp`（Streamable HTTP）。若设了读取 tok
 交替发送未标粒度的旧桶。普通心率按时间戳去重；卡路里、距离使用后到的总量；血氧、压力、HRV、体温、
 静息心率按时间戳去重。睡眠 session 按时间跨度重叠判断同一晚并保留更完整版本，同一起止和时长的补传
 更新阶段与评分；睡眠统计、情绪、睡眠呼吸暂停、运动记录按时间戳整条替换。个人资料单独存成 `profile.json`，
-后者覆盖前者，内容没变就不重写。
+夜醒事件单独存成 `wake-events.json`（同一夜重传不重复，被修正掉的那条随之消失）；两者内容没变就不重写。
 
 `workouts[].heart_rate` 为 `[{"timestamp":"ISO 时间","value":心率}]`，运动及恢复点合并、相同时间去重，
 保留原始秒级时间；`end_time` 仍为实际运动结束时间，不限制恢复点范围。缺少该数组的历史运动继续使用普通心率。
