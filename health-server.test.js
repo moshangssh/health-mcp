@@ -1404,12 +1404,36 @@ test("高频末点五秒后过期，不复活更早的分钟心率", () => {
   }), BB_PARAMS);
   const gap = walk.events.find((event) => event.reason === "heart_rate_unavailable");
   assert.equal(gap.start, at(0.5) + 5000);
-  near(walk.estimation.minutes, 25 / 60);
+  // 运动一开始就作废了运动前的压力读数，那之后的缺口也计入估算，所以这里只看心率缺测那一项。
+  near(walk.contributions.heart_rate_unavailable.minutes, 25 / 60);
   const withNewMinute = walkBodyBattery(batteryInputs({
     heartRate: [[at(0), 180], [at(0.75), 50]], workoutHeartRate: [[at(0.5), 140]], stress: [[at(0), 30]],
     sleeps: [{ start: at(0), end: at(1), awake: [] }],
   }), BB_PARAMS);
-  near(withNewMinute.estimation.minutes, 10 / 60);
+  near(withNewMinute.contributions.heart_rate_unavailable.minutes, 10 / 60);
+});
+
+test("运动一开始就作废运动前的压力读数，结束后不再拿它充电", () => {
+  // 静息 50、最大 190：160 bpm 的储备 0.79 落在活动区；压力 20 是低压恢复态。
+  // 运动心率要每五秒一个点（保持时长只有 5 秒）才连得起活动状态；普通分钟心率只在运动前后给，
+  // 免得它比运动心率新、把 160 bpm 顶掉。
+  const input = (stress) => batteryInputs({
+    heartRate: [...readings(0, 10, 1, 50), ...readings(21, 60, 1, 50)],
+    workoutHeartRate: Array.from({ length: 121 }, (_, i) => [at(10 + i / 12), 160]),
+    stress, sleeps: [{ start: at(0), end: at(60), awake: [] }],
+  });
+  const stale = walkBodyBattery(input([[at(5), 20]]), BB_PARAMS);
+  // 运动前那份读数只在运动开始前算数（第 5 到 10 分）；运动结束（20 分 + 5 秒保持）到 60 分
+  // 没有新样本，全程低强度耗电，不再出现拿旧低压读数充电的段落。
+  near(stale.contributions.sleep_recovery.minutes, 5);
+  near(stale.contributions.activity.minutes, 10 + 5 / 60);
+  assert.ok(stale.contributions.stress_unavailable.minutes > 30, "运动结束后到新读数到达前按 stress_unavailable 耗电");
+  const none = walkBodyBattery(input([]), BB_PARAMS);
+  assert.equal(none.contributions.sleep_recovery, undefined, "没有那份读数时运动前那 5 分钟不充电");
+  // 运动期间到达的压力样本也不是恢复态：它不带来任何充电，整段结果与从未有过压力读数一致。
+  const duringActivity = walkBodyBattery(input([[at(12), 20]]), BB_PARAMS);
+  assert.equal(duringActivity.level, none.level);
+  assert.deepEqual(duringActivity.contributions, none.contributions);
 });
 
 test("心率按有效期过期后才用原始覆盖区分缺测和未知", () => {
@@ -1505,7 +1529,9 @@ test("运动恢复心率跨午夜不被运动结束截断，补传与一次上�
   assert.deepEqual(result.daily.map((value) => value.date), [day, nextDay]);
   assert.equal(result.observed_max_heart_rate, 140);
   assert.equal(result.initial.source, "configured");
-  assert.equal(result.estimated, false);
+  // 运动一开始就作废了运动前的压力读数（这条记录里只有那一份），运动结束后的 30 秒没有新样本，
+  // 按 stress_unavailable 估算，所以整段历史带缺测标记。
+  assert.equal(result.estimated, true);
   const raw = readHealthToolResult(partialDir, { data_type: "series", days: 3 }).series[0];
   assert.deepEqual(raw.workouts[0].heart_rate, points);
   const today = readHealthToolResult(partialDir, { data_type: "body_battery", days: 1 }).body_battery;

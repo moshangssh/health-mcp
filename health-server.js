@@ -1045,6 +1045,12 @@ function walkBodyBattery(inputs, params) {
       }
     } else if (sleepIndex < sleeps.length) next = Math.min(next, sleeps[sleepIndex].start);
 
+    // 运动一开始，运动前测得的恢复态即被打破：作废那个读数，也不再拿运动期间到达的读数
+    // 顶替（运动中的手环压力分不是恢复态）。之后储备仍高就继续活动耗电；储备回落又没有新
+    // 读数时由 stressFresh 自然转假，走低强度耗电，直到运动结束后有新样本才回到压力分支。
+    // 放在本轮的 flags 与 next 之后：两者还要用这一轮已经算好的 stressFresh 和 lastStress。
+    if (state === "activity") lastStress = null;
+
     const before = level; const minutes = (next - t) / MINUTE_MS;
     level = Math.min(params.max_level, Math.max(params.min_level, level + delta * minutes));
     const charged = Math.max(0, level - before); const drained = Math.max(0, before - level);
