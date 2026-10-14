@@ -7,7 +7,7 @@ const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { hostHeaderValidation } = require("@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js");
 const { z } = require("zod");
 const { buildAllowedHosts, installRequestObservability, mountMcpEndpoint } = require("./shared/http-runtime");
-const { METHODS: TRAINING_LOAD_METHODS, METHOD_UNITS, addDays, computeTrainingLoad } = require("./training-load");
+const { METHODS: TRAINING_LOAD_METHODS, METHOD_UNITS, addDays, computeTrainingLoad, localDateStart } = require("./training-load");
 
 const DEFAULT_DATA_DIR = "/var/lib/health-mcp";
 const VALID_TYPES = new Set(["steps", "heart_rate", "sleep", "workouts", "all"]);
@@ -18,7 +18,7 @@ const TRAINING_LOAD_DETAILS = ["summary", "workouts"];
 const MAX_READ_DAYS = 62;
 const TZ = process.env.HEALTH_TZ || "Asia/Shanghai";
 
-// Built once: the body battery walk asks for the local date every quarter hour of the whole history.
+// Built once: the body battery walk asks for the local date at every local midnight of the whole history.
 const LOCAL_DATE_FORMAT = new Intl.DateTimeFormat("en-CA", {
   timeZone: TZ,
   year: "numeric",
@@ -918,7 +918,8 @@ function sleepChargeMultiplier(stageKey, params) {
 }
 
 // 从第一晚入睡积分到最后一条数据，始终计算 [t, next) 的实际时长。
-// 每分钟内再按读数、有效期和每个睡眠阶段的边界切分，状态点表示已经积分到该时刻。
+// 状态点表示已经积分到该时刻；切分点只有数据驱动的边界（新读数、读数过期、覆盖区间、
+// 睡眠阶段、离腕判定、曲线点、当地午夜），不按整分钟切分——积分是线性的，那是纯多余的迭代。
 // 缺必需基线时整段算不出来，返回 `{ uncomputable: { reason, date } }`，不抛异常。
 function walkBodyBattery(inputs, params) {
   const { heartRate, workoutHeartRate = [], heartRateCoverage = [], stress, steps = [], restingByDate, sleeps } = inputs;
@@ -932,7 +933,11 @@ function walkBodyBattery(inputs, params) {
   const curveMs = params.curve_interval_minutes * MINUTE_MS;
   let level = params.initial_level;
   let hrIndex = 0; let workoutIndex = 0; let coverageIndex = 0; let stressIndex = 0; let sleepIndex = 0; let restingIndex = -1; let stepIndex = 0;
-  let lastHr = null; let lastWorkoutHr = null; let lastStress = null; let lastStep = null; let silentSince = null; let date = null;
+  let lastHr = null; let lastWorkoutHr = null; let lastStress = null; let lastStep = null; let silentSince = null;
+  // 当地日期只在当地午夜推进；`midnightMs` 同时是一个切分点，[t, next) 因此不会跨午夜，
+  // 一段区间里的充放电始终记在同一天。
+  let date = formatLocalDate(new Date(start));
+  let midnightMs = localDateStart(addDays(date, 1), formatLocalDate);
   let intervalEstimated = false;
   const estimation = { minutes: 0, charged: 0, drained: 0 };
   const contributions = {};
@@ -957,8 +962,8 @@ function walkBodyBattery(inputs, params) {
     // 会话内当前时刻落在哪个阶段；阶段之间没有覆盖到的空隙是 null。
     const stage = night === null ? null : night.stages.find(([from, to]) => from <= t && t < to) || null;
     const asleep = night !== null && stage?.[2] !== "awake_min";
-    // 步长经过每个整分钟；时区偏移为整刻钟，当地日期也只在整刻钟边界变化。
-    if (date === null || t % (15 * MINUTE_MS) === 0) date = formatLocalDate(new Date(t));
+    // 当地日期跨过午夜才推进，两个日期分支都不再依赖切分粒度或时区偏移。
+    if (t >= midnightMs) { date = formatLocalDate(new Date(t)); midnightMs = localDateStart(addDays(date, 1), formatLocalDate); }
     while (restingIndex + 1 < restingDates.length && restingDates[restingIndex + 1] <= date) restingIndex += 1;
 
     const workoutExpires = lastWorkoutHr === null ? t : lastWorkoutHr[0] + params.workout_heart_rate_hold_seconds * 1000;
@@ -1026,7 +1031,7 @@ function walkBodyBattery(inputs, params) {
       if (flags[type] && !open[type]) open[type] = { type, reason, start: t, from: level };
     }
 
-    let next = Math.min(end, (Math.floor(t / MINUTE_MS) + 1) * MINUTE_MS, (Math.floor(t / curveMs) + 1) * curveMs);
+    let next = Math.min(end, (Math.floor(t / curveMs) + 1) * curveMs, midnightMs);
     if (hrIndex < heartRate.length) next = Math.min(next, heartRate[hrIndex][0]);
     if (workoutIndex < workoutHeartRate.length) next = Math.min(next, workoutHeartRate[workoutIndex][0]);
     if (coverage) next = Math.min(next, coverage.end);

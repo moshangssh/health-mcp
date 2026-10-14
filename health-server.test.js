@@ -1234,6 +1234,20 @@ test("午夜分摊真实时长，跨日充放电收支守恒", () => {
   near(walk.level, BB_PARAMS.initial_level + walk.days.reduce((sum, day) => sum + day.charged - day.drained, 0));
 });
 
+test("曲线上没有任何边界落在午夜时，日期仍由午夜本身切开", () => {
+  // 曲线点落在 13 分钟的倍数上、心率与压力落在 7 分钟的倍数上，没有一个读数、有效期或曲线点
+  // 落在整点那一刻。分日的边界只能来自当地午夜本身，否则跨过午夜的那一段会整段记到前一天。
+  const sleepRate = BB_PARAMS.sleep_charge_per_stress_point * (BB_PARAMS.stress_threshold - 25);
+  const walk = walkBodyBattery(batteryInputs({
+    heartRate: readings(0, 119, 7, 50), stress: readings(0, 119, 7, 25),
+    sleeps: [{ start: at(0), end: at(120), awake: [] }],
+  }), { ...BB_PARAMS, curve_interval_minutes: 13 });
+  assert.deepEqual(walk.days.map((day) => day.date), ["2026-09-01", "2026-09-02"]);
+  near(walk.days[0].charged, 60 * sleepRate);
+  near(walk.days[1].charged, 60 * sleepRate);
+  near(walk.level, BB_PARAMS.initial_level + walk.days.reduce((sum, day) => sum + day.charged - day.drained, 0));
+});
+
 test("补传同一睡眠的清醒阶段和评分，与一次完整上传得到相同电量", (t) => {
   freezeClock(t);
   const resentDir = tmpDataDir(); const completeDir = tmpDataDir();
