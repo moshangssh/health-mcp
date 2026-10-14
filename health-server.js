@@ -1003,7 +1003,10 @@ function walkBodyBattery(inputs, params) {
       // 需要心率储备却没有基线时不默认一个静息心率，也不返回假装确定的电量：整段历史没法算，
       // 直接把缺哪一天报出去，交给调用方判断（与训练负荷的 uncomputable 同一种降级）。
       if (resting === undefined) return { uncomputable: { reason: "missing_resting_heart_rate", date: night ? wakingDates[sleepIndex] : date } };
-      const reserve = (selectedHr[1] - resting) / (params.max_heart_rate - resting);
+      // 最大心率不高于静息心率时公式没有定义域（除零或负分母），与训练负荷同一条降级。
+      if (!(params.max_heart_rate > resting)) return { uncomputable: { reason: "invalid_heart_rate_range", date: night ? wakingDates[sleepIndex] : date } };
+      // 噪点心率会推出 reserve > 1，按公式定义域截到 [0, 1]，不给活动耗电留无上限的放大。
+      const reserve = Math.min(1, Math.max(0, (selectedHr[1] - resting) / (params.max_heart_rate - resting)));
       if (!stressFresh) gapReason = "stress_unavailable";
       if (reserve > params.activity_reserve_threshold) {
         const activityDrain = Math.max(params.low_intensity_drain_per_minute, params.activity_drain_per_reserve * (reserve - params.activity_reserve_threshold));

@@ -1141,6 +1141,22 @@ test("缺少必需的静息心率时整段降级为 uncomputable，心率缺测�
   assert.equal(noHeartRate.curve.at(-1).estimated, true);
 });
 
+test("高于最大心率的噪点读数把储备截到 1，活动耗电不再随它放大", () => {
+  // 静息 50、最大 190 时，250 bpm 的储备按公式是 1.43，截到 1 后十分钟只耗 0.84 分/分。
+  const walk = walkBodyBattery(batteryInputs({
+    heartRate: readings(0, 10, 1, 250), sleeps: [{ start: at(0), end: at(10), awake: [] }],
+  }), BB_PARAMS);
+  near(walk.level, BB_PARAMS.initial_level - 10 * BB_PARAMS.activity_drain_per_reserve * (1 - BB_PARAMS.activity_reserve_threshold));
+  near(walk.contributions.activity.drained, 10 * BB_PARAMS.activity_drain_per_reserve * (1 - BB_PARAMS.activity_reserve_threshold));
+});
+
+test("最大心率不高于静息心率时降级为 invalid_heart_rate_range，日期与缺基线同一条取值", () => {
+  const input = (sleeps) => batteryInputs({ heartRate: readings(0, 1, 1, 140), sleeps });
+  const range = { ...BB_PARAMS, max_heart_rate: 40 };
+  assert.deepEqual(walkBodyBattery(input([{ start: at(0), end: at(1), awake: [] }]), range), { uncomputable: { reason: "invalid_heart_rate_range", date: "2026-09-01" } });
+  assert.deepEqual(walkBodyBattery(input([{ start: at(0), end: at(70), awake: [] }]), range), { uncomputable: { reason: "invalid_heart_rate_range", date: "2026-09-02" } });
+});
+
 test("一分钟和不足一分钟只按实际经过时长积分", () => {
   for (const duration of [1, 0.5, 1.25]) {
     const start = at(0.25); const end = start + duration * 60000;
