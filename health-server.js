@@ -919,6 +919,7 @@ function sleepChargeMultiplier(stageKey, params) {
 
 // 从第一晚入睡积分到最后一条数据，始终计算 [t, next) 的实际时长。
 // 每分钟内再按读数、有效期和每个睡眠阶段的边界切分，状态点表示已经积分到该时刻。
+// 缺必需基线时整段算不出来，返回 `{ uncomputable: { reason, date } }`，不抛异常。
 function walkBodyBattery(inputs, params) {
   const { heartRate, workoutHeartRate = [], heartRateCoverage = [], stress, steps = [], restingByDate, sleeps } = inputs;
   const restingDates = [...restingByDate.keys()].sort();
@@ -999,7 +1000,9 @@ function walkBodyBattery(inputs, params) {
       // 睡眠会话（含夜醒）取醒来日静息心率，清醒区间沿用当日或最近历史值；小睡按清醒区间取。
       const restingDate = night ? wakingDates[sleepIndex] : restingDates[restingIndex];
       const resting = restingByDate.get(restingDate);
-      if (resting === undefined) throw new Error(`身体电量缺少 ${night ? wakingDates[sleepIndex] : date} 的静息心率数据`);
+      // 需要心率储备却没有基线时不默认一个静息心率，也不返回假装确定的电量：整段历史没法算，
+      // 直接把缺哪一天报出去，交给调用方判断（与训练负荷的 uncomputable 同一种降级）。
+      if (resting === undefined) return { uncomputable: { reason: "missing_resting_heart_rate", date: night ? wakingDates[sleepIndex] : date } };
       const reserve = (selectedHr[1] - resting) / (params.max_heart_rate - resting);
       if (!stressFresh) gapReason = "stress_unavailable";
       if (reserve > params.activity_reserve_threshold) {
@@ -1074,6 +1077,8 @@ function bodyBattery(dataDir, days) {
   // 记录里只有小睡、一次夜睡都没有的库也属这一类——小睡不是一夜，不从它建曲线。
   if (!inputs.sleeps.some((session) => !session.nap)) return null;
   const walk = walkBodyBattery(inputs, params);
+  // 整段历史算不出来时只有缺什么这一件事可说，没有可以逐日降级的部分——电量是一条连续曲线。
+  if (walk.uncomputable) return { status: "uncomputable", ...walk.uncomputable };
   // The history is always walked whole; `days` only picks how many local days of it are shown.
   const since = new Date();
   since.setDate(since.getDate() - (days - 1));
@@ -1276,7 +1281,7 @@ function readHealthToolResult(dataDir, args = {}) {
   if (dataType === "series") return withContext({ ...range, series: records.map(seriesForRecord) });
   if (dataType === "body_battery") return withContext({ ...range, body_battery: bodyBattery(dataDir, days) });
   if (dataType === "training_load") return withContext({ ...range, training_load: trainingLoad(dataDir, days, args) });
-  return withContext({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, today_heart_rate: latestSample(todayRecord), spo2: latestSeriesValue(todayRecord, "spo2"), stress: latestSeriesValue(todayRecord, "stress"), hrv: latestSeriesValue(todayRecord, "hrv"), temperature: latestSeriesValue(todayRecord, "temperature"), sleep_score: nullableNumber(latestSleepStats(todayRecord)?.sleep_score), today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, recent_sleep_list: sleep, summaries });
+  return withContext({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, today_heart_rate: latestSample(todayRecord), spo2: latestSeriesValue(todayRecord, "spo2"), stress: latestSeriesValue(todayRecord, "stress"), hrv: latestSeriesValue(todayRecord, "hrv"), temperature: latestSeriesValue(todayRecord, "temperature"), sleep_score: nullableNumber(latestSleepStats(todayRecord)?.sleep_score), today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, recent_sleep_list: sleep, recent_sleep_stats_list: sleepStatsList(records), recent_workout_list: workoutEntries(records), summaries, body_battery: bodyBattery(dataDir, days), training_load: trainingLoad(dataDir, days, args) });
 }
 
 function buildSummaryText(records) {

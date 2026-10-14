@@ -1129,12 +1129,13 @@ test("首夜及其夜醒使用醒来日静息心率而非入睡日基线", () =>
   assert.deepEqual(previousDayDifferent, onlyWakingDay);
 });
 
-test("缺少必需的静息心率明确失败，心率缺测估算无需基线", () => {
+test("缺少必需的静息心率时整段降级为 uncomputable，心率缺测估算无需基线", () => {
   const inputs = batteryInputs({
     heartRate: readings(0, 1, 1, 140), stress: readings(0, 1, 1, 18),
     sleeps: [{ start: at(0), end: at(1), awake: [] }], restingByDate: new Map(),
   });
-  assert.throws(() => walkBodyBattery(inputs, BB_PARAMS), /静息心率.*2026-09-01|2026-09-01.*静息心率/);
+  // 需要心率储备却没有基线：整条曲线无从积分，报出缺的是哪一天，不默认一个静息心率。
+  assert.deepEqual(walkBodyBattery(inputs, BB_PARAMS), { uncomputable: { reason: "missing_resting_heart_rate", date: "2026-09-01" } });
   const noHeartRate = walkBodyBattery({ ...inputs, heartRate: [] }, BB_PARAMS);
   near(noHeartRate.level, BB_PARAMS.initial_level - BB_PARAMS.low_intensity_drain_per_minute);
   assert.equal(noHeartRate.curve.at(-1).estimated, true);
@@ -1249,7 +1250,7 @@ test("补传同一睡眠的清醒阶段和评分，与一次完整上传得到�
   assert.deepEqual(readHealthToolResult(resentDir, query).body_battery, resent);
 });
 
-test("电量工具保留非整分钟时间，缺少基线通过 MCP 明确报错", async (t) => {
+test("电量工具保留非整分钟时间，缺少基线时降级成结构化的 uncomputable", async (t) => {
   freezeClock(t);
   const dir = tmpDataDir();
   const start = "2026-09-06T01:00:15.250+08:00";
@@ -1264,9 +1265,11 @@ test("电量工具保留非整分钟时间，缺少基线通过 MCP 明确报错
   await server.connect(serverTransport);
   await client.connect(clientTransport);
   t.after(async () => { await client.close(); await server.close(); });
-  const failed = await client.callTool({ name: "health_read", arguments: { data_type: "body_battery" } });
-  assert.equal(failed.isError, true);
-  assert.match(failed.content[0].text, /2026-09-06.*静息心率/);
+  const degraded = await client.callTool({ name: "health_read", arguments: { data_type: "body_battery" } });
+  const answered = JSON.parse(degraded.content[0].text);
+  assert.notEqual(degraded.isError, true, "缺基线不再让整次工具调用失败");
+  assert.equal(answered.success, true);
+  assert.deepEqual(answered.body_battery, { status: "uncomputable", reason: "missing_resting_heart_rate", date: "2026-09-06" });
 
   mergeHealthData(dir, { date: "2026-09-06", resting_heart_rate: [{ timestamp: end, value: 50 }] });
   const battery = readHealthToolResult(dir, { data_type: "body_battery", days: 1 }).body_battery;
@@ -1274,6 +1277,35 @@ test("电量工具保留非整分钟时间，缺少基线通过 MCP 明确报错
   assert.equal(battery.curve[0].time, "9/6 01:00:15.250");
   assert.equal(battery.curve.at(-1).time, battery.as_of);
   assert.equal(battery.events.find((event) => event.type === "activity").end, battery.as_of);
+});
+
+test("all 补齐运动、睡眠报告、身体电量和训练负荷，缺基线只降级身体电量", (t) => {
+  freezeClock(t);
+  const date = "2026-09-06";
+  const day = {
+    date,
+    heart_rate: [{ timestamp: "2026-09-05T23:00:00+08:00", value: 52 }, { timestamp: `${date}T07:00:00+08:00`, value: 52 }],
+    stress: [{ timestamp: `${date}T06:00:00+08:00`, value: 18, level: 1 }],
+    sleep: [{ session_start_time: "2026-09-05T23:00:00+08:00", session_end_time: `${date}T06:00:00+08:00`, duration_seconds: 25200, stages: [] }],
+    workouts: [{ timestamp: `${date}T07:30:00+08:00`, activity: "walking", end_time: `${date}T08:05:00+08:00`, duration_seconds: 2100, avg_heart_rate: 120 }],
+  };
+  const dir = tmpDataDir();
+  mergeHealthData(dir, { ...day, resting_heart_rate: [{ timestamp: `${date}T06:00:00+08:00`, value: 50 }] });
+  const all = readHealthToolResult(dir, { data_type: "all" });
+  assert.equal(all.data_type, "all");
+  assert.equal(all.recent_workout_list.length, 1);
+  assert.ok(Array.isArray(all.recent_sleep_stats_list), "睡眠报告跟着 all 一起给出");
+  assert.ok(all.body_battery.level > 0);
+  assert.equal(all.training_load.summary.date, date);
+  assert.equal("series" in all, false, "all 不含 series，原始序列要单独按 data_type: series 取");
+
+  // 缺静息基线时只有身体电量降级，同一份记录里的其他字段照常给出，整次读取不失败。
+  const noBaseline = tmpDataDir();
+  mergeHealthData(noBaseline, day);
+  const degraded = readHealthToolResult(noBaseline, { data_type: "all" });
+  assert.deepEqual(degraded.body_battery, { status: "uncomputable", reason: "missing_resting_heart_rate", date });
+  assert.equal(degraded.success, true);
+  assert.equal(degraded.recent_workout_list.length, 1);
 });
 
 test("一分钟步数整日快照替换旧五分钟桶，重传和清空都不重复累计", (t) => {
