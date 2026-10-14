@@ -202,6 +202,18 @@ function sleepStageMetricKey(stage) {
   return null;
 }
 
+function stageMinutesOf(session, keys) {
+  return (Array.isArray(session.stages) ? session.stages : []).reduce((total, stage) => keys.includes(sleepStageMetricKey(stage.stage)) ? total + Math.round(Number(stage.duration_seconds || 0) / 60) : total, 0);
+}
+
+// 小睡的两条判据，展示层和身体电量共用这一个：手环明确打了 nap 阶段，或整段没有一刻
+// 深睡/浅睡/REM、只有清醒。没有阶段信息的会话无从判断，不算小睡——旧版把整夜当一个对象
+// 上传的那条路径不能因此被误判成白天的小睡。
+function isNapSession(session) {
+  return stageMinutesOf(session, ["nap_min"]) > 0
+    || (stageMinutesOf(session, ["awake_min"]) > 0 && stageMinutesOf(session, ["deep_min", "light_min", "rem_min"]) === 0);
+}
+
 function summarizeSleepSessions(sessions, updatedAt) {
   const summary = {
     duration_min: 0,
@@ -688,15 +700,13 @@ function formatLocalClock(value) {
 // 这一夜本身（旧版把整夜当一个对象上传的那条路径），它的阶段值正是这一夜的，直接读。
 function sleepSession(record, session, hasOwnSessions) {
   const stages = Array.isArray(session.stages) ? session.stages : [];
-  const stageMinutes = (names) => stages.reduce((total, stage) => String(stage.stage ?? "").toLowerCase() && names.some((name) => String(stage.stage ?? "").toLowerCase() === name || String(stage.stage ?? "").toLowerCase().includes(name)) ? total + Math.round(Number(stage.duration_seconds || 0) / 60) : total, 0);
-  const deep = stageMinutes(["5", "deep"]); const light = stageMinutes(["4", "light"]); const rem = stageMinutes(["6", "rem"]); const awake = stageMinutes(["1", "3", "7", "awake", "out_of_bed"]);
-  const nap = stageMinutes(["nap"]);
+  const deep = stageMinutesOf(session, ["deep_min"]); const light = stageMinutesOf(session, ["light_min"]); const rem = stageMinutesOf(session, ["rem_min"]); const awake = stageMinutesOf(session, ["awake_min"]);
   const duration = nullableNumber(session.duration_min) ?? 0;
   // A session the watch tagged as a nap is one, whatever its stage mix looks like. The awake-only
   // rule stays for sources that carry no nap tag: theirs is inferred from a session spent entirely
   // awake. A nap reports no deep, light or rem of its own, and the day's totals must not stand in
   // for them, or the whole night's stages would be read back as this nap's.
-  const isNap = nap > 0 || (awake > 0 && deep === 0 && light === 0 && rem === 0);
+  const isNap = isNapSession(session);
   const toIso = (value) => Number.isNaN(new Date(value || "").getTime()) ? null : new Date(value).toISOString();
   const result = { type: isNap ? "nap" : "sleep", start: formatLocalClock(session.start), end: formatLocalClock(session.end), start_at: toIso(session.start), end_at: toIso(session.end), total_minutes: duration, duration_text: `${Math.floor(duration / 60)}h ${duration % 60}min` };
   if (isNap) return result;
@@ -879,6 +889,8 @@ function readBodyBatteryInputs(dataDir) {
       sleeps.push({
         start: Date.parse(session.start),
         end: Date.parse(session.end),
+        // 小睡留在列表里并带上标记，但 walk 不把它当一夜：将来要单独给小睡建模只改这一处判断。
+        nap: isNapSession(session),
         // 全部阶段都进 walk：深睡/REM 的充电倍率要看它，积分也要按它的边界切开。认不出的阶段不参与，
         // 它覆盖的时段就落在「没有阶段信息」那一类里。
         stages: session.stages
@@ -911,9 +923,11 @@ function walkBodyBattery(inputs, params) {
   const { heartRate, workoutHeartRate = [], heartRateCoverage = [], stress, steps = [], restingByDate, sleeps } = inputs;
   const restingDates = [...restingByDate.keys()].sort();
   const wakingDates = sleeps.map((session) => formatLocalDate(new Date(session.end)));
-  const start = sleeps[0].start;
+  // 小睡不是一夜：负荷曲线不从它起算，也不由它收尾。
+  const nights = sleeps.filter((session) => !session.nap);
+  const start = nights[0].start;
   const end = Math.max(heartRate.at(-1)?.[0] ?? 0, workoutHeartRate.at(-1)?.[0] ?? 0, stress.at(-1)?.[0] ?? 0,
-    ...sleeps.map((session) => session.end), heartRateCoverage.reduce((latest, interval) => Math.max(latest, interval.end), 0));
+    ...nights.map((session) => session.end), heartRateCoverage.reduce((latest, interval) => Math.max(latest, interval.end), 0));
   const curveMs = params.curve_interval_minutes * MINUTE_MS;
   let level = params.initial_level;
   let hrIndex = 0; let workoutIndex = 0; let coverageIndex = 0; let stressIndex = 0; let sleepIndex = 0; let restingIndex = -1; let stepIndex = 0;
@@ -936,9 +950,12 @@ function walkBodyBattery(inputs, params) {
     while (stepIndex < steps.length && steps[stepIndex][0] <= t) lastStep = steps[stepIndex++];
     while (sleepIndex < sleeps.length && sleeps[sleepIndex].end <= t) sleepIndex += 1;
     const session = sleeps[sleepIndex]?.start <= t ? sleeps[sleepIndex] : null;
+    // 小睡不是夜里的那一觉：它没有睡眠语义，落在里面的时刻按普通清醒区间处理，不产生睡眠事件，
+    // 也不按睡眠速率充电。
+    const night = session?.nap ? null : session;
     // 会话内当前时刻落在哪个阶段；阶段之间没有覆盖到的空隙是 null。
-    const stage = session === null ? null : session.stages.find(([from, to]) => from <= t && t < to) || null;
-    const asleep = session !== null && stage?.[2] !== "awake_min";
+    const stage = night === null ? null : night.stages.find(([from, to]) => from <= t && t < to) || null;
+    const asleep = night !== null && stage?.[2] !== "awake_min";
     // 步长经过每个整分钟；时区偏移为整刻钟，当地日期也只在整刻钟边界变化。
     if (date === null || t % (15 * MINUTE_MS) === 0) date = formatLocalDate(new Date(t));
     while (restingIndex + 1 < restingDates.length && restingDates[restingIndex + 1] <= date) restingIndex += 1;
@@ -979,10 +996,10 @@ function walkBodyBattery(inputs, params) {
       gapReason = coverage?.status === "missing" ? "heart_rate_missing" : "heart_rate_unavailable";
       state = gapReason; delta = -params.low_intensity_drain_per_minute;
     } else {
-      // 睡眠会话（含夜醒）取醒来日静息心率，清醒区间沿用当日或最近历史值。
-      const restingDate = session ? wakingDates[sleepIndex] : restingDates[restingIndex];
+      // 睡眠会话（含夜醒）取醒来日静息心率，清醒区间沿用当日或最近历史值；小睡按清醒区间取。
+      const restingDate = night ? wakingDates[sleepIndex] : restingDates[restingIndex];
       const resting = restingByDate.get(restingDate);
-      if (resting === undefined) throw new Error(`身体电量缺少 ${session ? wakingDates[sleepIndex] : date} 的静息心率数据`);
+      if (resting === undefined) throw new Error(`身体电量缺少 ${night ? wakingDates[sleepIndex] : date} 的静息心率数据`);
       const reserve = (selectedHr[1] - resting) / (params.max_heart_rate - resting);
       if (!stressFresh) gapReason = "stress_unavailable";
       if (reserve > params.activity_reserve_threshold) {
@@ -996,7 +1013,7 @@ function walkBodyBattery(inputs, params) {
       }
     }
 
-    const flags = { sleep: session !== null, activity: state === "activity", unworn, data_gap: gapReason !== null, high_stress: !unworn && stressFresh && lastStress[1] >= params.high_stress_level };
+    const flags = { sleep: night !== null, activity: state === "activity", unworn, data_gap: gapReason !== null, high_stress: !unworn && stressFresh && lastStress[1] >= params.high_stress_level };
     for (const type of BODY_BATTERY_EVENTS) {
       const reason = type === "data_gap" ? gapReason : null;
       if (open[type] && (!flags[type] || open[type].reason !== reason)) { close(open[type], t, level); open[type] = null; }
@@ -1054,7 +1071,8 @@ function bodyBattery(dataDir, days) {
   const params = { ...JSON.parse(fs.readFileSync(BODY_BATTERY_PARAMS_PATH, "utf8")), max_heart_rate: readMaxHeartRate() };
   const inputs = readBodyBatteryInputs(dataDir);
   // The walk starts at the first night's sleep; before one is on record there is no battery yet.
-  if (!inputs.sleeps.length) return null;
+  // 记录里只有小睡、一次夜睡都没有的库也属这一类——小睡不是一夜，不从它建曲线。
+  if (!inputs.sleeps.some((session) => !session.nap)) return null;
   const walk = walkBodyBattery(inputs, params);
   // The history is always walked whole; `days` only picks how many local days of it are shown.
   const since = new Date();
@@ -1400,6 +1418,7 @@ module.exports = {
   formatLocalDate,
   mergeHealthData,
   normalizeSleepSession,
+  readBodyBatteryInputs,
   readHealthRecords,
   readHealthToolResult,
   readProfile,

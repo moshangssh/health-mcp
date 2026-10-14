@@ -6,7 +6,7 @@ const path = require("node:path");
 const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
 const { InMemoryTransport } = require("@modelcontextprotocol/sdk/inMemory.js");
 
-const { buildSummaryText, createApp, createHealthMcpServer, cycleContextForDate, dailySummary, formatLocalDate, mergeHealthData, normalizeSleepSession, readHealthRecords, readHealthToolResult, readProfile, storeCycleConfig, walkBodyBattery } = require("./health-server");
+const { buildSummaryText, createApp, createHealthMcpServer, cycleContextForDate, dailySummary, formatLocalDate, mergeHealthData, normalizeSleepSession, readBodyBatteryInputs, readHealthRecords, readHealthToolResult, readProfile, storeCycleConfig, walkBodyBattery } = require("./health-server");
 
 function tmpDataDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "health-mcp-test-"));
@@ -983,6 +983,63 @@ test("落盘的睡眠阶段进 walk，深睡那一半按倍率充", (t) => {
   assert.ok(charged > 240 * stageRate(BB_PARAMS.light_sleep_charge_multiplier), "整段按浅睡算只有 30，深睡那一小时要多充出来");
 });
 
+test("小睡那段与不在任何会话中逐位一致，按夜睡算则更高", () => {
+  // 三份输入只差 30..60 这一段怎么算：标了小睡、完全没有会话、同长度的夜睡。
+  const walks = (second) => walkBodyBattery(batteryInputs({
+    heartRate: readings(0, 90, 1, 50), stress: readings(0, 90, 10, 25),
+    sleeps: [{ start: at(0), end: at(30), stages: [[at(0), at(30), "deep_min"]] }, ...(second ? [second] : [])],
+  }), BB_PARAMS);
+  const asNap = walks({ start: at(30), end: at(60), nap: true, stages: [[at(30), at(60), "nap_min"]] });
+  const noSession = walks(null);
+  const asNight = walks({ start: at(30), end: at(60), stages: [[at(30), at(60), "light_min"]] });
+  near(asNap.level, noSession.level);
+  assert.deepEqual(asNap.contributions, noSession.contributions);
+  near(asNap.contributions.sleep_recovery.minutes, 30);
+  assert.equal(asNap.events.filter((event) => event.type === "sleep").length, 1);
+  assert.ok(asNight.level - asNap.level > 0.1, "同一段会话按夜睡算要按睡眠速率充，比按小睡算高得多");
+});
+
+test("只有清醒阶段、或打了 nap 阶段都标成小睡，没有阶段信息的不算", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  const night = { session_start_time: "2026-09-06T00:00:00+08:00", session_end_time: "2026-09-06T08:00:00+08:00", duration_seconds: 28800 };
+  mergeHealthData(dir, { date: "2026-09-06", sleep: [
+    { ...night, stages: [{ stage: "light", start_time: "2026-09-06T00:00:00+08:00", end_time: "2026-09-06T08:00:00+08:00", duration_seconds: 28800 }] },
+    { session_start_time: "2026-09-06T11:00:00+08:00", session_end_time: "2026-09-06T11:30:00+08:00", duration_seconds: 1800, stages: [{ stage: "nap", start_time: "2026-09-06T11:00:00+08:00", end_time: "2026-09-06T11:30:00+08:00", duration_seconds: 1800 }] },
+    { session_start_time: "2026-09-06T14:00:00+08:00", session_end_time: "2026-09-06T14:20:00+08:00", duration_seconds: 1200, stages: [{ stage: "awake", start_time: "2026-09-06T14:00:00+08:00", end_time: "2026-09-06T14:20:00+08:00", duration_seconds: 1200 }] },
+    { session_start_time: "2026-09-06T16:00:00+08:00", session_end_time: "2026-09-06T16:40:00+08:00", duration_seconds: 2400, stages: [] },
+  ] });
+  assert.deepEqual(readBodyBatteryInputs(dir).sleeps.map((session) => session.nap), [false, true, true, false], "小睡留在列表里并带标记，没有阶段信息的会话不判小睡");
+});
+
+test("小睡不按睡眠速率充电，也不产生睡眠事件", (t) => {
+  freezeClock(t);
+  const start = Date.parse("2026-09-06T00:00:00+08:00");
+  const timestamp = (m) => new Date(start + m * 60000).toISOString();
+  const nap = { session_start_time: timestamp(600), session_end_time: timestamp(660), duration_seconds: 3600, stages: [{ stage: "nap", start_time: timestamp(600), end_time: timestamp(660), duration_seconds: 3600 }] };
+  const snapshot = (sleep) => ({
+    date: "2026-09-06",
+    heart_rate: Array.from({ length: 721 }, (_, m) => ({ timestamp: timestamp(m), value: 50 })),
+    stress: Array.from({ length: 73 }, (_, m) => ({ timestamp: timestamp(m * 10), value: 25 })),
+    resting_heart_rate: [{ timestamp: timestamp(0), value: 50 }],
+    sleep,
+  });
+  const night = { session_start_time: timestamp(0), session_end_time: timestamp(480), duration_seconds: 28800, stages: [
+    { stage: "deep", start_time: timestamp(0), end_time: timestamp(240), duration_seconds: 14400 },
+    { stage: "light", start_time: timestamp(240), end_time: timestamp(480), duration_seconds: 14400 },
+  ] };
+  const withNapDir = tmpDataDir(); const withoutNapDir = tmpDataDir();
+  mergeHealthData(withNapDir, snapshot([night, nap]));
+  mergeHealthData(withoutNapDir, snapshot([night]));
+  const query = { data_type: "body_battery", time_range: "today" };
+  const withNap = readHealthToolResult(withNapDir, query).body_battery;
+  const withoutNap = readHealthToolResult(withoutNapDir, query).body_battery;
+  near(withNap.level, withoutNap.level);
+  assert.deepEqual(withNap.contributions, withoutNap.contributions);
+  assert.deepEqual(withNap.events, withoutNap.events);
+  assert.equal(withNap.events.filter((event) => event.type === "sleep").length, 1, "只有那一夜产生睡眠事件");
+});
+
 test("长时间无心率也无步数判为离腕并冻结，有步数活动仍按缺测消耗", () => {
   const input = (steps) => batteryInputs({
     heartRate: [...readings(0, 60, 1, 50), [at(180), 50]],
@@ -1166,7 +1223,13 @@ test("补传同一睡眠的清醒阶段和评分，与一次完整上传得到�
   const start = Date.parse("2026-09-06T01:00:00+08:00");
   const timestamp = (m) => new Date(start + m * 60000).toISOString();
   const sleep = { session_start_time: timestamp(0), session_end_time: timestamp(240), duration_seconds: 14400, stages: [] };
-  const corrected = { ...sleep, score: 90, stages: [{ stage: "awake", start_time: timestamp(60), end_time: timestamp(180), duration_seconds: 7200 }] };
+  // 补传的是一夜的清醒阶段，两侧的浅睡阶段要一起给：只剩清醒阶段的会话会被判成小睡，
+  // 那一层不在这个用例要测的东西里。
+  const corrected = { ...sleep, score: 90, stages: [
+    { stage: "light", start_time: timestamp(0), end_time: timestamp(60), duration_seconds: 3600 },
+    { stage: "awake", start_time: timestamp(60), end_time: timestamp(180), duration_seconds: 7200 },
+    { stage: "light", start_time: timestamp(180), end_time: timestamp(240), duration_seconds: 3600 },
+  ] };
   const data = {
     date: "2026-09-06",
     heart_rate: Array.from({ length: 241 }, (_, m) => ({ timestamp: timestamp(m), value: 50 })),
