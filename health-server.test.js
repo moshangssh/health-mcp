@@ -903,7 +903,12 @@ function readings(from, to, step, value) {
 }
 
 function batteryInputs({ heartRate, workoutHeartRate = [], heartRateCoverage = [], stress = [], steps = [], sleeps, restingByDate = new Map([["2026-09-01", 50], ["2026-09-02", 50]]) }) {
-  return { heartRate, workoutHeartRate, heartRateCoverage, stress, steps, restingByDate, sleeps, observedMaxHeartRate: 0 };
+  // walk 收的是阶段列表。`awake` 只是「整段都在清醒」这一种会话的简写，写上就是单个清醒阶段。
+  const withStages = sleeps.map(({ awake = [], stages = [], ...session }) => ({
+    ...session,
+    stages: [...awake.map(([from, to]) => [from, to, "awake_min"]), ...stages],
+  }));
+  return { heartRate, workoutHeartRate, heartRateCoverage, stress, steps, restingByDate, sleeps: withStages, observedMaxHeartRate: 0 };
 }
 
 test("a calm night charges the battery, slower in its awake stages", () => {
@@ -922,6 +927,60 @@ test("a stressed night drains instead of charging", () => {
   const walk = walkBodyBattery(batteryInputs({ heartRate: readings(0, 60, 1, 50), stress: readings(0, 60, 10, 40), sleeps: [{ start: at(0), end: at(60), awake: [] }] }), BB_PARAMS);
   assert.ok(walk.level < BB_PARAMS.initial_level);
   assert.ok(walk.events.find((event) => event.type === "sleep").change < 0);
+});
+
+// 睡眠阶段的充电倍率：每分钟的基准充电量，压力 25 时正好在阈值下 5 分。
+const stageRate = (multiplier) => multiplier * BB_PARAMS.sleep_charge_per_stress_point * (BB_PARAMS.stress_threshold - 25);
+const calmSleep = (stages, cautious = false) => walkBodyBattery(batteryInputs({
+  heartRate: readings(0, 60, 1, 50), stress: readings(0, 60, 10, 25),
+  sleeps: [cautious ? { start: at(0), end: at(60), awake: [] } : { start: at(0), end: at(60), stages }],
+}), BB_PARAMS);
+
+test("深睡按倍率加速充电，浅睡与没有阶段信息的夜晚仍是基准速率", () => {
+  const half = calmSleep([[at(0), at(30), "deep_min"], [at(30), at(60), "light_min"]]);
+  near(half.level, BB_PARAMS.initial_level + 30 * stageRate(BB_PARAMS.deep_sleep_charge_multiplier) + 30 * stageRate(BB_PARAMS.light_sleep_charge_multiplier));
+  assert.ok(half.level > BB_PARAMS.initial_level + 60 * stageRate(BB_PARAMS.light_sleep_charge_multiplier), "同样是半小时深睡，比整段浅睡充得多");
+  // 手环不分阶段的会话没有阶段可读，整段按浅睡倍率，数值与只有 awake 区间时一致。
+  near(calmSleep(null, true).level, BB_PARAMS.initial_level + 60 * stageRate(BB_PARAMS.light_sleep_charge_multiplier));
+});
+
+test("REM 倍率单独可调，默认为 1 与浅睡同速", () => {
+  const rem = calmSleep([[at(0), at(60), "rem_min"]]);
+  near(rem.level, calmSleep([[at(0), at(60), "light_min"]]).level);
+  const noCharge = walkBodyBattery(batteryInputs({
+    heartRate: readings(0, 60, 1, 50), stress: readings(0, 60, 10, 25),
+    sleeps: [{ start: at(0), end: at(60), stages: [[at(0), at(60), "rem_min"]] }],
+  }), { ...BB_PARAMS, rem_sleep_charge_multiplier: 0 });
+  near(noCharge.level, BB_PARAMS.initial_level);
+});
+
+test("阶段边界不落在整分钟时也切开积分", () => {
+  const walk = calmSleep([[at(0), at(30.5), "deep_min"], [at(30.5), at(60), "light_min"]]);
+  near(walk.level, BB_PARAMS.initial_level + 30.5 * stageRate(BB_PARAMS.deep_sleep_charge_multiplier) + 29.5 * stageRate(BB_PARAMS.light_sleep_charge_multiplier));
+});
+
+test("落盘的睡眠阶段进 walk，深睡那一半按倍率充", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  const start = Date.parse("2026-09-06T01:00:00+08:00");
+  const timestamp = (m) => new Date(start + m * 60000).toISOString();
+  mergeHealthData(dir, {
+    date: "2026-09-06",
+    heart_rate: Array.from({ length: 241 }, (_, m) => ({ timestamp: timestamp(m), value: 50 })),
+    stress: Array.from({ length: 25 }, (_, m) => ({ timestamp: timestamp(m * 10), value: 25 })),
+    resting_heart_rate: [{ timestamp: timestamp(0), value: 50 }],
+    sleep: [{
+      session_start_time: timestamp(0), session_end_time: timestamp(240), duration_seconds: 14400,
+      stages: [
+        { stage: "deep", start_time: timestamp(0), end_time: timestamp(60), duration_seconds: 3600 },
+        { stage: "light", start_time: timestamp(60), end_time: timestamp(240), duration_seconds: 10800 },
+      ],
+    }],
+  });
+  // 充/耗电按 0.1 取整后给出，避开整段电量在 .5 上取整的边界。
+  const charged = readHealthToolResult(dir, { data_type: "body_battery", time_range: "today" }).body_battery.contributions.sleep_recovery.charged;
+  near(charged, 60 * stageRate(BB_PARAMS.deep_sleep_charge_multiplier) + 180 * stageRate(BB_PARAMS.light_sleep_charge_multiplier));
+  assert.ok(charged > 240 * stageRate(BB_PARAMS.light_sleep_charge_multiplier), "整段按浅睡算只有 30，深睡那一小时要多充出来");
 });
 
 test("长时间无心率也无步数判为离腕并冻结，有步数活动仍按缺测消耗", () => {

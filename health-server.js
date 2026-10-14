@@ -879,7 +879,11 @@ function readBodyBatteryInputs(dataDir) {
       sleeps.push({
         start: Date.parse(session.start),
         end: Date.parse(session.end),
-        awake: session.stages.filter((stage) => sleepStageMetricKey(stage.stage) === "awake_min").map((stage) => [Date.parse(stage.start), Date.parse(stage.end)]),
+        // 全部阶段都进 walk：深睡/REM 的充电倍率要看它，积分也要按它的边界切开。认不出的阶段不参与，
+        // 它覆盖的时段就落在「没有阶段信息」那一类里。
+        stages: session.stages
+          .map((stage) => [Date.parse(stage.start), Date.parse(stage.end), sleepStageMetricKey(stage.stage)])
+          .filter(([, , key]) => key !== null),
       });
     }
   }
@@ -892,8 +896,17 @@ function readBodyBatteryInputs(dataDir) {
   };
 }
 
+// 睡眠阶段对充电速率的加权。深睡恢复最快；浅睡是基准速率（倍率 1.0），会话里没有阶段信息的时段
+// 也按它算，所以手环不分阶段的夜晚数值不变。REM 默认与浅睡同速，但单独留出参数：REM 期交感活跃、
+// 手环压力分偏高，将来要单独调只用改参数文件。
+function sleepChargeMultiplier(stageKey, params) {
+  if (stageKey === "deep_min") return params.deep_sleep_charge_multiplier;
+  if (stageKey === "rem_min") return params.rem_sleep_charge_multiplier;
+  return params.light_sleep_charge_multiplier;
+}
+
 // 从第一晚入睡积分到最后一条数据，始终计算 [t, next) 的实际时长。
-// 每分钟内再按读数、有效期和睡眠阶段边界切分，状态点表示已经积分到该时刻。
+// 每分钟内再按读数、有效期和每个睡眠阶段的边界切分，状态点表示已经积分到该时刻。
 function walkBodyBattery(inputs, params) {
   const { heartRate, workoutHeartRate = [], heartRateCoverage = [], stress, steps = [], restingByDate, sleeps } = inputs;
   const restingDates = [...restingByDate.keys()].sort();
@@ -923,7 +936,9 @@ function walkBodyBattery(inputs, params) {
     while (stepIndex < steps.length && steps[stepIndex][0] <= t) lastStep = steps[stepIndex++];
     while (sleepIndex < sleeps.length && sleeps[sleepIndex].end <= t) sleepIndex += 1;
     const session = sleeps[sleepIndex]?.start <= t ? sleeps[sleepIndex] : null;
-    const asleep = session !== null && !session.awake.some(([from, to]) => from <= t && t < to);
+    // 会话内当前时刻落在哪个阶段；阶段之间没有覆盖到的空隙是 null。
+    const stage = session === null ? null : session.stages.find(([from, to]) => from <= t && t < to) || null;
+    const asleep = session !== null && stage?.[2] !== "awake_min";
     // 步长经过每个整分钟；时区偏移为整刻钟，当地日期也只在整刻钟边界变化。
     if (date === null || t % (15 * MINUTE_MS) === 0) date = formatLocalDate(new Date(t));
     while (restingIndex + 1 < restingDates.length && restingDates[restingIndex + 1] <= date) restingIndex += 1;
@@ -951,7 +966,7 @@ function walkBodyBattery(inputs, params) {
     let pressureDelta = 0;
     if (stressFresh) {
       const score = lastStress[1];
-      const charge = (asleep ? params.sleep_charge_per_stress_point : params.rest_charge_per_stress_point) * Math.max(0, params.stress_threshold - score);
+      const charge = (asleep ? sleepChargeMultiplier(stage?.[2], params) * params.sleep_charge_per_stress_point : params.rest_charge_per_stress_point) * Math.max(0, params.stress_threshold - score);
       const weight = Math.min(1, Math.max(0, (score - params.stress_threshold + params.stress_transition_half_width) / (2 * params.stress_transition_half_width)));
       pressureDelta = (1 - weight) * charge - weight * params.stress_drain_per_stress_point * score;
     }
@@ -1001,7 +1016,7 @@ function walkBodyBattery(inputs, params) {
     if (silent && !unworn) next = Math.min(next, silentSince + params.unworn_min_minutes * MINUTE_MS);
     if (session) {
       next = Math.min(next, session.end);
-      for (const [from, to] of session.awake) {
+      for (const [from, to] of session.stages) {
         if (from > t) next = Math.min(next, from);
         if (to > t) next = Math.min(next, to);
       }

@@ -116,7 +116,7 @@ curl http://127.0.0.1:3100/healthz   # 返回 {"ok":true,...}
 当时的值，既不充电也不消耗，也不计入缺测估算。重新出现心率或步数活动即结束该事件。
 
 算法从有记录的第一晚入睡开始，**从不按天重置**，所以每次调用都会重算全部历史，
-`days` / `time_range` 只决定输出显示多少天。每分钟内按新读数、读数过期和睡眠阶段的真实时间再切分，
+`days` / `time_range` 只决定输出显示多少天。每分钟内按新读数、读数过期和每个睡眠阶段的边界再切分，
 只积分 `[起点, 终点)` 的实际时长，不足一分钟按比例计算；曲线起点是初始电量，其他点表示已积分到
 该时刻，事件不会越过 `as_of`。每日收支记录受电量上下限约束后的实际变化。
 
@@ -134,9 +134,13 @@ curl http://127.0.0.1:3100/healthz   # 返回 {"ok":true,...}
 4. 没有压力读数，或最近一次读数已满 30 分钟 → 按低强度耗电；
 5. 否则使用局部连续压力映射。设阈值 `T = stress_threshold`、过渡半宽 `w = stress_transition_half_width`，
    `q = clamp((压力 − T + w) / (2w), 0, 1)`；恢复分支为
-   `C = max(T − 压力, 0) × 恢复系数`（睡眠与清醒系数不同），耗损分支为
+   `C = max(T − 压力, 0) × 恢复系数`（睡眠与清醒系数不同，睡眠再按阶段加权），耗损分支为
    `D = 压力 × stress_drain_per_stress_point`，净变化率为 `(1−q) × C − q × D`。
    默认仅在 25–35 压力分范围混合，两侧严格保持原公式；30 不再是跳变点，也不被假定为零变化点。
+   睡眠中 `C = max(T − 压力, 0) × sleep_charge_per_stress_point × 阶段倍率`，倍率按当前所处阶段取：
+   深睡 `deep_sleep_charge_multiplier`（默认 1.2）、浅睡 `light_sleep_charge_multiplier`、REM
+   `rem_sleep_charge_multiplier`（两者默认 1.0）。手环不分阶段的会话、以及阶段没覆盖到的空隙都按浅睡倍率算，
+   所以默认值下只有深睡阶段比引入阶段加权之前充得快。清醒阶段仍用 `rest_charge_per_stress_point`，不加倍率。
 
 读数的有效期统一为 `[读数时间, 读数时间 + 保留时长)`，到期就不再沿用。积分终点由最后心率、压力、
 睡眠结束或已取得活动历史覆盖终点确定，不外推至服务器当前时钟。恢复心率可超过运动的 `end_time`，
@@ -148,7 +152,8 @@ curl http://127.0.0.1:3100/healthz   # 返回 {"ok":true,...}
 所有阈值和速率都在项目根目录的 [`body-battery.json`](body-battery.json) 里，每次调用重新读取，
 所以改完参数立刻对全部历史生效，不用重启。沿用历史配置键 `unworn_after_minutes`，它同时是普通心率
 读数和步数活动证据的有效期；`unworn_min_minutes` 是判定未佩戴所需的连续静默时长，两者都改完立即生效。
-新增 `workout_heart_rate_hold_seconds`、`stress_transition_half_width` 和 `unworn_min_minutes`，
+新增 `workout_heart_rate_hold_seconds`、`stress_transition_half_width`、`unworn_min_minutes` 和睡眠阶段倍率
+`deep_sleep_charge_multiplier` / `light_sleep_charge_multiplier` / `rem_sleep_charge_multiplier`，
 部署新代码时需一起更新参数文件。
 过渡半宽 5 只是可调工程平滑宽度，不是华为官方参数或个体生理校准值。
 默认速率不是佳明的真实算法，也没有实测校准过；初始电量和充放电速率是模型假设，分数不代表真实剩余能量百分比。
