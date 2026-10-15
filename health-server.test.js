@@ -1621,6 +1621,15 @@ test("运动恢复心率跨午夜不被运动结束截断，补传与一次上�
   assert.deepEqual(readHealthToolResult(partialDir, request).body_battery, result);
 });
 
+// 与 formatLocalClock 同一个坑：本地午夜那个小时必须读作 00:00，不能读作 24:00。
+test("每小时的桶把本地午夜读作 00:00，不读作 24:00", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  mergeHealthData(dir, { date: "2026-09-06", heart_rate: [{ timestamp: "2026-09-05T16:10:00Z", bpm: 60 }] });
+  const result = readHealthToolResult(dir, { data_type: "heart_rate", heart_rate_detail: "hourly", days: 3 });
+  assert.deepEqual(result.hourly_summaries.map((summary) => summary.hour), ["2026-09-06 00:00"]);
+});
+
 // 训练负荷：走完整读取路径，从落盘的原始运动对象算出三种口径，再按方法和运动类型读回。
 const TL_PARAMS = readJson("training-load.json");
 const MAX_HEART_RATE = readJson("heart-rate.json").max_heart_rate;

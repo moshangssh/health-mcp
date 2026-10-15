@@ -691,7 +691,7 @@ function lastIngestAt(records) {
 function formatLocalClock(value) {
   const date = new Date(value || "");
   if (Number.isNaN(date.getTime())) return null;
-  const parts = new Intl.DateTimeFormat("en-US", { timeZone: TZ, month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(date).reduce((result, part) => { result[part.type] = part.value; return result; }, {});
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: TZ, month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(date).reduce((result, part) => { result[part.type] = part.value; return result; }, {});
   return `${parts.month}/${parts.day} ${parts.hour}:${parts.minute}`;
 }
 
@@ -828,7 +828,7 @@ function hourlyHeartRateSummaries(records) {
   for (const record of records) for (const sample of record?.heart_rate?.samples || []) {
     const value = nullableNumber(sample.bpm ?? sample.value); const date = new Date(sample.ts || sample.timestamp || sample.time || "");
     if (value === null || Number.isNaN(date.getTime())) continue;
-    const parts = new Intl.DateTimeFormat("en-CA", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hour12: false }).formatToParts(date).reduce((result, part) => { result[part.type] = part.value; return result; }, {});
+    const parts = new Intl.DateTimeFormat("en-CA", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hourCycle: "h23" }).formatToParts(date).reduce((result, part) => { result[part.type] = part.value; return result; }, {});
     const hour = `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:00`;
     if (!buckets.has(hour)) buckets.set(hour, []); buckets.get(hour).push(value);
   }
