@@ -989,7 +989,11 @@ function walkBodyBattery(inputs, params) {
     let pressureDelta = 0;
     if (stressFresh) {
       const score = lastStress[1];
-      const charge = (asleep ? sleepChargeMultiplier(stage?.[2], params) * params.sleep_charge_per_stress_point : params.rest_charge_per_stress_point) * Math.max(0, params.stress_threshold - score);
+      // 剩余容量阻尼：充电倍率在点数下限处是 1，到 charge_saturation_target 处降到 charge_saturation_floor，
+      // 目标之上不再有充电项（定义域截断，同 reserve 与 hrRatio 的写法）。用区间起点的 level——积分是
+      // 线性递推而不是直线，一段足够长的低压力夜晚仍会向目标逼近，只是越来越慢。
+      const saturation = params.charge_saturation_floor + (1 - params.charge_saturation_floor) * Math.max(0, (params.charge_saturation_target - level) / (params.charge_saturation_target - params.min_level));
+      const charge = (asleep ? sleepChargeMultiplier(stage?.[2], params) * params.sleep_charge_per_stress_point : params.rest_charge_per_stress_point) * Math.max(0, params.stress_threshold - score) * saturation;
       const weight = Math.min(1, Math.max(0, (score - params.stress_threshold + params.stress_transition_half_width) / (2 * params.stress_transition_half_width)));
       pressureDelta = (1 - weight) * charge - weight * params.stress_drain_per_stress_point * score;
     }

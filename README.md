@@ -150,6 +150,14 @@ curl http://127.0.0.1:3100/healthz   # 返回 {"ok":true,...}
    深睡 `deep_sleep_charge_multiplier`（默认 1.2）、浅睡 `light_sleep_charge_multiplier`、REM
    `rem_sleep_charge_multiplier`（两者默认 1.0）。手环不分阶段的会话、以及阶段没覆盖到的空隙都按浅睡倍率算，
    所以默认值下只有深睡阶段比引入阶段加权之前充得快。清醒阶段仍用 `rest_charge_per_stress_point`，不加倍率。
+   两条恢复分支的 `C` 还都要乘一个剩余容量倍率：`charge_saturation_floor + (1 − charge_saturation_floor)
+   × max(0, (charge_saturation_target − 电量) / (charge_saturation_target − min_level))`，电量取该段区间
+   起点的值。倍率在点数下限处正好是 1、在 `charge_saturation_target`（默认 90）处降到
+   `charge_saturation_floor`（默认 0），电量到达目标之后充电项就是 0，只剩耗电。收敛点由目标钉住，
+   不再像纯线性阻尼那样恒在天花板上，所以再长的低压力夜晚也顶不到上限，只会向目标渐近。
+   `charge_saturation_floor` 取 1 等于关掉阻尼（倍率恒为 1，与引入它之前的线性充电逐位一致），
+   取大于 0 则收敛点落在目标之上。积分因此是线性递推而不是直线：一段区间里的充电量由该区间起点的
+   电量决定，`sleep_charge_per_stress_point` 只决定逼近目标的快慢。
 
 读数的有效期统一为 `[读数时间, 读数时间 + 保留时长)`，到期就不再沿用。积分终点由最后心率、压力、
 睡眠结束或已取得活动历史覆盖终点确定，不外推至服务器当前时钟。恢复心率可超过运动的 `end_time`，
@@ -164,9 +172,11 @@ curl http://127.0.0.1:3100/healthz   # 返回 {"ok":true,...}
 所有阈值和速率都在项目根目录的 [`body-battery.json`](body-battery.json) 里，每次调用重新读取，
 所以改完参数立刻对全部历史生效，不用重启。沿用历史配置键 `unworn_after_minutes`，它同时是普通心率
 读数和步数活动证据的有效期；`unworn_min_minutes` 是判定未佩戴所需的连续静默时长，两者都改完立即生效。
-新增 `workout_heart_rate_hold_seconds`、`stress_transition_half_width`、`unworn_min_minutes` 和睡眠阶段倍率
-`deep_sleep_charge_multiplier` / `light_sleep_charge_multiplier` / `rem_sleep_charge_multiplier`，
-部署新代码时需一起更新参数文件。
+新增 `workout_heart_rate_hold_seconds`、`stress_transition_half_width`、`unworn_min_minutes`、睡眠阶段倍率
+`deep_sleep_charge_multiplier` / `light_sleep_charge_multiplier` / `rem_sleep_charge_multiplier`，以及剩余容量
+阻尼的两个参数：`charge_saturation_target`（充电渐近的目标电量，默认 90）和 `charge_saturation_floor`
+（到达目标时残留的充电倍率，默认 0），部署新代码时需一起更新参数文件。`charge_saturation_floor` 取 1
+即等于没有阻尼，恢复成引入它之前的线性充电。
 过渡半宽 5 只是可调工程平滑宽度，不是华为官方参数或个体生理校准值。
 默认速率不是佳明的真实算法，也没有实测校准过；初始电量和充放电速率是模型假设，分数不代表真实剩余能量百分比。
 睡眠心率、静息心率取自手环。HRV、血氧、夜间基线、深睡连续性得分和步数
