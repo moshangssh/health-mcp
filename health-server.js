@@ -910,7 +910,8 @@ function readBodyBatteryInputs(dataDir) {
 
 // 睡眠阶段对充电速率的加权。深睡恢复最快；浅睡是基准速率（倍率 1.0），会话里没有阶段信息的时段
 // 也按它算，所以手环不分阶段的夜晚数值不变。REM 默认与浅睡同速，但单独留出参数：REM 期交感活跃、
-// 手环压力分偏高，将来要单独调只用改参数文件。
+// 将来要单独调只用改参数文件。睡眠恢复不读压力分：手环夜间压力常年在阈值之上（实测凌晨睡眠均值
+// 32.7），挂在压力上深睡倍率永远不生效、优质夜整晚掉电；速率 = sleep_charge_per_minute × 倍率。
 function sleepChargeMultiplier(stageKey, params) {
   if (stageKey === "deep_min") return params.deep_sleep_charge_multiplier;
   if (stageKey === "rem_min") return params.rem_sleep_charge_multiplier;
@@ -985,15 +986,15 @@ function walkBodyBattery(inputs, params) {
     const silent = !hrFresh && !stepFresh;
     if (silent) { if (silentSince === null) silentSince = t; } else silentSince = null;
     const unworn = silentSince !== null && t - silentSince >= params.unworn_min_minutes * MINUTE_MS;
-    // 只平滑阈值附近：区间外保持原恢复/耗损速率，不整体平移高压力区的消耗。
+    // 剩余容量阻尼：充电倍率在点数下限处是 1，到 charge_saturation_target 处降到 charge_saturation_floor，
+    // 目标之上不再有充电项（定义域截断，同 reserve 与 hrRatio 的写法）。用区间起点的 level——积分是
+    // 线性递推而不是直线，一段足够长的睡眠仍会向目标逼近，只是越来越慢。
+    const saturation = params.charge_saturation_floor + (1 - params.charge_saturation_floor) * Math.max(0, (params.charge_saturation_target - level) / (params.charge_saturation_target - params.min_level));
+    // 只平滑阈值附近：区间外保持原恢复/耗损速率，不整体平移高压力区的消耗。压力块只算清醒时段。
     let pressureDelta = 0;
-    if (stressFresh) {
+    if (!asleep && stressFresh) {
       const score = lastStress[1];
-      // 剩余容量阻尼：充电倍率在点数下限处是 1，到 charge_saturation_target 处降到 charge_saturation_floor，
-      // 目标之上不再有充电项（定义域截断，同 reserve 与 hrRatio 的写法）。用区间起点的 level——积分是
-      // 线性递推而不是直线，一段足够长的低压力夜晚仍会向目标逼近，只是越来越慢。
-      const saturation = params.charge_saturation_floor + (1 - params.charge_saturation_floor) * Math.max(0, (params.charge_saturation_target - level) / (params.charge_saturation_target - params.min_level));
-      const charge = (asleep ? sleepChargeMultiplier(stage?.[2], params) * params.sleep_charge_per_stress_point : params.rest_charge_per_stress_point) * Math.max(0, params.stress_threshold - score) * saturation;
+      const charge = params.rest_charge_per_stress_point * Math.max(0, params.stress_threshold - score) * saturation;
       const weight = Math.min(1, Math.max(0, (score - params.stress_threshold + params.stress_transition_half_width) / (2 * params.stress_transition_half_width)));
       pressureDelta = (1 - weight) * charge - weight * params.stress_drain_per_stress_point * score;
     }
@@ -1016,15 +1017,17 @@ function walkBodyBattery(inputs, params) {
       if (!(params.max_heart_rate > resting)) return { uncomputable: { reason: "invalid_heart_rate_range", date: night ? wakingDates[sleepIndex] : date } };
       // 噪点心率会推出 reserve > 1，按公式定义域截到 [0, 1]，不给活动耗电留无上限的放大。
       const reserve = Math.min(1, Math.max(0, (selectedHr[1] - resting) / (params.max_heart_rate - resting)));
-      if (!stressFresh) gapReason = "stress_unavailable";
+      if (!stressFresh && !asleep) gapReason = "stress_unavailable";
       if (reserve > params.activity_reserve_threshold) {
         const activityDrain = Math.max(params.low_intensity_drain_per_minute, params.activity_drain_per_reserve * (reserve - params.activity_reserve_threshold));
         state = "activity"; delta = -Math.max(activityDrain, stressDrain);
-      } else if (!stressFresh) {
+      } else if (!stressFresh && !asleep) {
         state = "stress_unavailable"; delta = -params.low_intensity_drain_per_minute;
       } else {
-        state = pressureDelta > 0 ? (asleep ? "sleep_recovery" : "rest_recovery") : "stress";
-        delta = pressureDelta;
+        // 睡眠恢复由阶段和时长驱动（见 sleepChargeMultiplier 的注释），压力缺失同样照充，不缺测；
+        // 清醒两支沿用上面的压力块。
+        state = asleep ? "sleep_recovery" : pressureDelta > 0 ? "rest_recovery" : "stress";
+        delta = asleep ? sleepChargeMultiplier(stage?.[2], params) * params.sleep_charge_per_minute * saturation : pressureDelta;
       }
     }
 
