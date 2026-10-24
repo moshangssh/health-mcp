@@ -1118,6 +1118,48 @@ test("长时间无心率也无步数判为离腕并冻结，有步数活动仍�
   assert.ok(worn.level < walk.level, "戴着时缺测继续消耗，不像离腕那样冻结");
 });
 
+test("observed 覆盖的静默是断联不是离腕：不冻结，按缺测消耗", () => {
+  // 手环在测（coverage=observed）却长时间没有样本：样本没传上来而已，静默计时照走但离腕判定被挡住。
+  const input = (status) => batteryInputs({
+    heartRate: [...readings(0, 60, 1, 50), [at(200), 50]],
+    stress: readings(0, 60, 10, 18),
+    heartRateCoverage: [{ start: at(75), end: at(200), status }],
+    sleeps: [{ start: at(0), end: at(1), awake: [] }],
+  });
+  const observed = walkBodyBattery(input("observed"), BB_PARAMS);
+  assert.ok(observed.events.every((event) => event.type !== "unworn"), "手环在测就不判离腕");
+  const gap = observed.events.find((event) => event.type === "data_gap" && event.reason === "heart_rate_unavailable");
+  assert.equal(gap.start, at(75));
+  assert.equal(gap.end, at(200));
+  near(gap.change, -125 * BB_PARAMS.low_intensity_drain_per_minute);
+  assert.equal(observed.curve.at(-1).estimated, true, "断联估算仍标在曲线上");
+  // 同样的静默若 coverage 说的是 missing，仍是离腕：observed 挡的只是「在测却没样本」这一种。
+  const missing = walkBodyBattery(input("missing"), BB_PARAMS);
+  const unworn = missing.events.find((event) => event.type === "unworn");
+  assert.equal(unworn.start, at(75) + BB_PARAMS.unworn_min_minutes * 60000);
+  near(unworn.change, 0);
+});
+
+test("静默超过上限后由离腕转断联缺测，不再冻结", () => {
+  // 摘表（充电/洗澡）罕见超过几小时：静默拖过 unworn_max_minutes 之外的只能按缺测估算消耗。
+  const walk = walkBodyBattery(batteryInputs({
+    heartRate: [...readings(0, 60, 1, 50), [at(460), 50]],
+    stress: readings(0, 60, 10, 18),
+    sleeps: [{ start: at(0), end: at(1), awake: [] }],
+  }), BB_PARAMS);
+  const unworn = walk.events.find((event) => event.type === "unworn");
+  // 静默从最后读数过期（at(60)+15min）起算：60 分钟缺测、到上限为止的离腕冻结、其后断联估算。
+  assert.equal(unworn.start, at(75) + BB_PARAMS.unworn_min_minutes * 60000);
+  assert.equal(unworn.end, at(75) + BB_PARAMS.unworn_max_minutes * 60000);
+  near(unworn.change, 0);
+  const gap = walk.events.find((event) => event.type === "data_gap" && event.reason === "sync_gap");
+  assert.equal(gap.start, unworn.end);
+  assert.equal(gap.end, at(460));
+  near(gap.change, -(460 - 375) * BB_PARAMS.low_intensity_drain_per_minute);
+  assert.ok((walk.contributions.sync_gap?.minutes ?? 0) > 0, "断联缺测单列一项贡献");
+  assert.equal(walk.curve.at(-1).estimated, true);
+});
+
 test("a heart rate reserve above the threshold drains as activity", () => {
   const walk = walkBodyBattery(batteryInputs({ heartRate: readings(0, 30, 1, 140), sleeps: [{ start: at(0), end: at(1), awake: [] }] }), BB_PARAMS);
   assert.ok(walk.events.find((event) => event.type === "activity").change < -10);

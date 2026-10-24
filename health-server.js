@@ -980,12 +980,16 @@ function walkBodyBattery(inputs, params) {
     const stressExpires = lastStress === null ? t : lastStress[0] + params.stress_hold_minutes * MINUTE_MS;
     const stressFresh = t < stressExpires;
     // 手环没有离腕模式：无心率读数、且阈值内也没有步数活动，两条证据都缺失。短暂的抖动不判离腕，
-    // 静默连续超过 unworn_min_minutes 才认定为未佩戴。
+    // 静默连续超过 unworn_min_minutes 才认定为未佩戴。coverage=observed 的时段手环在测，静默只是
+    // 样本没传上来（断联/上传滞后），不算离腕——静默计时照旧累计，observed 只挡住判定。
     const stepExpires = lastStep === null ? t : lastStep[0] + params.unworn_after_minutes * MINUTE_MS;
     const stepFresh = lastStep !== null && t < stepExpires;
     const silent = !hrFresh && !stepFresh;
     if (silent) { if (silentSince === null) silentSince = t; } else silentSince = null;
-    const unworn = silentSince !== null && t - silentSince >= params.unworn_min_minutes * MINUTE_MS;
+    const unworn = silentSince !== null && t - silentSince >= params.unworn_min_minutes * MINUTE_MS
+      && coverage?.status !== "observed";
+    // 摘表（充电/洗澡）罕见超过几小时，静默拖过 unworn_max_minutes 之外剩下的只能是断联缺测。
+    const syncGap = silentSince !== null && t - silentSince >= params.unworn_max_minutes * MINUTE_MS;
     // 剩余容量阻尼：充电倍率在点数下限处是 1，到 charge_saturation_target 处降到 charge_saturation_floor，
     // 目标之上不再有充电项（定义域截断，同 reserve 与 hrRatio 的写法）。用区间起点的 level——积分是
     // 线性递推而不是直线，一段足够长的睡眠仍会向目标逼近，只是越来越慢。
@@ -1000,7 +1004,10 @@ function walkBodyBattery(inputs, params) {
     }
     const stressDrain = Math.max(0, -pressureDelta);
     let state; let delta; let gapReason = null;
-    if (unworn) {
+    if (syncGap) {
+      // 断联缺测：静默远超摘表可能，按低强度耗损估算并计入 estimated（同文件内缺口的语义），不再冻结。
+      gapReason = "sync_gap"; state = gapReason; delta = -params.low_intensity_drain_per_minute;
+    } else if (unworn) {
       // 离腕期间电量保持不变，既不充电也不消耗，也不计入缺测估算。
       state = "unworn"; delta = 0;
     } else if (!hrFresh) {
@@ -1031,7 +1038,7 @@ function walkBodyBattery(inputs, params) {
       }
     }
 
-    const flags = { sleep: night !== null, activity: state === "activity", unworn, data_gap: gapReason !== null, high_stress: !unworn && stressFresh && lastStress[1] >= params.high_stress_level };
+    const flags = { sleep: night !== null, activity: state === "activity", unworn: state === "unworn", data_gap: gapReason !== null, high_stress: !unworn && stressFresh && lastStress[1] >= params.high_stress_level };
     for (const type of BODY_BATTERY_EVENTS) {
       const reason = type === "data_gap" ? gapReason : null;
       if (open[type] && (!flags[type] || open[type].reason !== reason)) { close(open[type], t, level); open[type] = null; }
@@ -1048,7 +1055,14 @@ function walkBodyBattery(inputs, params) {
     if (hrFresh) next = Math.min(next, hrExpires);
     if (stressFresh) next = Math.min(next, stressExpires);
     if (stepFresh) next = Math.min(next, stepExpires);
-    if (silent && !unworn) next = Math.min(next, silentSince + params.unworn_min_minutes * MINUTE_MS);
+    // 静默的两个判定跳变点（判离腕、判断联）各自收窄下一段。只在边界还在未来时收缩：observed 会挡住
+    // unworn 判定但计时继续，布尔与时刻不再同步，不能再用布尔当「边界已过」的信号。
+    if (silentSince !== null) {
+      const unwornAt = silentSince + params.unworn_min_minutes * MINUTE_MS;
+      const syncGapAt = silentSince + params.unworn_max_minutes * MINUTE_MS;
+      if (t < unwornAt) next = Math.min(next, unwornAt);
+      if (t < syncGapAt) next = Math.min(next, syncGapAt);
+    }
     if (session) {
       next = Math.min(next, session.end);
       for (const [from, to] of session.stages) {
