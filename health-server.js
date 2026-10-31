@@ -849,63 +849,136 @@ function readMaxHeartRate() {
 }
 const BODY_BATTERY_EVENTS = ["sleep", "activity", "unworn", "data_gap", "high_stress"];
 
-// Only the readings the walk needs, pulled out of each day file as it is read, so a year of history
-// never sits in memory as whole records.
-function readBodyBatteryInputs(dataDir) {
+// 单个日文件里 walk 需要的读数，解析即抽扁：二元组/小对象按 walk 的取用形状给出，整棵 JSON
+// 树在调用方合并完即可回收。字段与读法是身体电量和训练负荷共同的取数规则，只此一份。
+function extractBodyBatterySamples(record) {
   const heartRate = []; const workoutHeartRate = new Map(); const heartRateCoverage = [];
-  const stress = []; const restingByDate = new Map(); const sleeps = []; const steps = [];
+  const stress = []; const steps = []; const sleeps = [];
   let observedMaxHeartRate = 0;
-  const files = fs.readdirSync(dataDir).filter((name) => /^\d{4}-\d{2}-\d{2}\.json$/.test(name)).sort();
-  for (const name of files) {
-    const record = readRecord(path.join(dataDir, name), null);
-    for (const sample of record.heart_rate?.samples || []) {
-      heartRate.push([Date.parse(sample.ts), sample.bpm]);
-      observedMaxHeartRate = Math.max(observedMaxHeartRate, sample.bpm);
-    }
-    for (const workout of record.workouts || []) {
-      if (Number.isFinite(workout.max_heart_rate)) observedMaxHeartRate = Math.max(observedMaxHeartRate, workout.max_heart_rate);
-      // 恢复心率仍随运动开始日存储，不能按 end_time 截断；全历史按实际时间排序。
-      for (const sample of workout.heart_rate || []) {
-        const t = Date.parse(sample.timestamp); const bpm = Number(sample.value);
-        if (Number.isFinite(t) && Number.isFinite(bpm) && bpm > 0) {
-          workoutHeartRate.set(t, bpm);
-          observedMaxHeartRate = Math.max(observedMaxHeartRate, bpm);
-        }
+  for (const sample of record.heart_rate?.samples || []) {
+    heartRate.push([Date.parse(sample.ts), sample.bpm]);
+    observedMaxHeartRate = Math.max(observedMaxHeartRate, sample.bpm);
+  }
+  for (const workout of record.workouts || []) {
+    if (Number.isFinite(workout.max_heart_rate)) observedMaxHeartRate = Math.max(observedMaxHeartRate, workout.max_heart_rate);
+    // 恢复心率仍随运动开始日存储，不能按 end_time 截断；全历史按实际时间排序。
+    for (const sample of workout.heart_rate || []) {
+      const t = Date.parse(sample.timestamp); const bpm = Number(sample.value);
+      if (Number.isFinite(t) && Number.isFinite(bpm) && bpm > 0) {
+        workoutHeartRate.set(t, bpm);
+        observedMaxHeartRate = Math.max(observedMaxHeartRate, bpm);
       }
     }
-    for (const interval of record.heart_rate_coverage || []) {
-      heartRateCoverage.push({ start: Date.parse(interval.timestamp), end: Date.parse(interval.end_time), status: interval.status });
+  }
+  for (const interval of record.heart_rate_coverage || []) {
+    heartRateCoverage.push({ start: Date.parse(interval.timestamp), end: Date.parse(interval.end_time), status: interval.status });
+  }
+  for (const sample of record.stress?.samples || []) stress.push([Date.parse(sample.ts), sample.value]);
+  // 只有走过路才算活动证据；静止桶的零增量不进列表。
+  for (const sample of record.steps?.samples || []) {
+    const t = Date.parse(sample.ts); const value = Number(sample.value);
+    if (Number.isFinite(t) && Number.isFinite(value) && value > 0) steps.push([t, value]);
+  }
+  // The day's latest resting figure stands for the whole local day (Q29).
+  const resting = (record.resting_heart_rate?.samples || []).reduce((latest, sample) => (!latest || Date.parse(sample.ts) > Date.parse(latest.ts) ? sample : latest), null);
+  for (const session of record.sleep_sessions || []) {
+    sleeps.push({
+      start: Date.parse(session.start),
+      end: Date.parse(session.end),
+      // 小睡留在列表里并带上标记，但 walk 不把它当一夜：将来要单独给小睡建模只改这一处判断。
+      nap: isNapSession(session),
+      // 醒来日的本地日期：夜里的静息心率按它取，逐日拉取也按它决定何时读醒来日的文件。
+      wakingDate: formatLocalDate(new Date(session.end)),
+      // 全部阶段都进 walk：深睡/REM 的充电倍率要看它，积分也要按它的边界切开。认不出的阶段不参与，
+      // 它覆盖的时段就落在「没有阶段信息」那一类里。
+      stages: session.stages
+        .map((stage) => [Date.parse(stage.start), Date.parse(stage.end), sleepStageMetricKey(stage.stage)])
+        .filter(([, , key]) => key !== null),
+    });
+  }
+  return { date: record.date, heartRate, workoutHeartRate: [...workoutHeartRate], heartRateCoverage, stress, steps, resting: resting === null ? null : resting.value, sleeps, observedMaxHeartRate };
+}
+
+// 全历史的标量档案：walk 的终点 end（各类最后读数与最后一夜的最大值）、观测到的最大心率、
+// 有没有一夜夜睡、每类样本的全史最大时间戳。只留标量不攒样本——历史再长这里也是常数内存，
+// 样本本身由 bodyBatteryFeed 按日拉取、边拉边喂。
+function scanBodyBatteryHistory(dataDir) {
+  const files = fs.readdirSync(dataDir).filter((name) => /^\d{4}-\d{2}-\d{2}\.json$/.test(name)).sort();
+  const maxTs = { heartRate: 0, workoutHeartRate: 0, heartRateCoverage: 0, stress: 0, steps: 0, sleeps: 0 };
+  let end = 0; let observedMaxHeartRate = 0; let hasNight = false;
+  for (const name of files) {
+    const extract = extractBodyBatterySamples(readRecord(path.join(dataDir, name), null));
+    observedMaxHeartRate = Math.max(observedMaxHeartRate, extract.observedMaxHeartRate);
+    for (const [t] of extract.heartRate) maxTs.heartRate = Math.max(maxTs.heartRate, t);
+    for (const [t] of extract.workoutHeartRate) maxTs.workoutHeartRate = Math.max(maxTs.workoutHeartRate, t);
+    for (const interval of extract.heartRateCoverage) {
+      maxTs.heartRateCoverage = Math.max(maxTs.heartRateCoverage, interval.start);
+      end = Math.max(end, interval.end);
     }
-    for (const sample of record.stress?.samples || []) stress.push([Date.parse(sample.ts), sample.value]);
-    // 只有走过路才算活动证据；静止桶的零增量不进列表。
-    for (const sample of record.steps?.samples || []) {
-      const t = Date.parse(sample.ts); const value = Number(sample.value);
-      if (Number.isFinite(t) && Number.isFinite(value) && value > 0) steps.push([t, value]);
-    }
-    // The day's latest resting figure stands for the whole local day (Q29).
-    const resting = (record.resting_heart_rate?.samples || []).reduce((latest, sample) => (!latest || Date.parse(sample.ts) > Date.parse(latest.ts) ? sample : latest), null);
-    if (resting) restingByDate.set(record.date, resting.value);
-    for (const session of record.sleep_sessions || []) {
-      sleeps.push({
-        start: Date.parse(session.start),
-        end: Date.parse(session.end),
-        // 小睡留在列表里并带上标记，但 walk 不把它当一夜：将来要单独给小睡建模只改这一处判断。
-        nap: isNapSession(session),
-        // 全部阶段都进 walk：深睡/REM 的充电倍率要看它，积分也要按它的边界切开。认不出的阶段不参与，
-        // 它覆盖的时段就落在「没有阶段信息」那一类里。
-        stages: session.stages
-          .map((stage) => [Date.parse(stage.start), Date.parse(stage.end), sleepStageMetricKey(stage.stage)])
-          .filter(([, , key]) => key !== null),
-      });
+    for (const [t] of extract.stress) maxTs.stress = Math.max(maxTs.stress, t);
+    for (const [t] of extract.steps) maxTs.steps = Math.max(maxTs.steps, t);
+    for (const session of extract.sleeps) {
+      maxTs.sleeps = Math.max(maxTs.sleeps, session.start);
+      if (!session.nap) { hasNight = true; end = Math.max(end, session.end); }
     }
   }
+  return { files, end: Math.max(end, maxTs.heartRate, maxTs.workoutHeartRate, maxTs.stress), observedMaxHeartRate, hasNight, maxTs };
+}
+
+// 逐日拉取的 walk 输入。缓冲里只留游标未消费的尾部，驻留是单日量级、与历史年限无关。
+// 拉取时机（pump）有两条，都不假设日文件内部的样本按时间有序——每次拉取把缓冲与新增一并重排：
+// - resting 完整性：不晚于当前当地日的文件必须全部在手（restingDates 才能像全量路径一样只向前
+//   扫描），夜里的静息心率按醒来日取，拉到醒来日的文件为止。
+// - 某类缓冲空了而该类样本的全史最大时间戳还在未来：下一批样本只可能在未拉取的文件里，不拉就
+//   会错过 next 在切分边界上的收窄；最大时间戳被 t 越过之后，这一类永远不会再饿。
+function bodyBatteryFeed(dataDir, bounds, fromDate) {
+  const files = bounds.files; const maxTs = bounds.maxTs;
+  let fileIndex = 0;
+  const heartRate = []; const workoutHeartRate = []; const heartRateCoverage = [];
+  const stress = []; const steps = []; const sleeps = [];
+  const restingByDate = new Map(); const restingDates = [];
   const byTime = (a, b) => a[0] - b[0];
-  return {
-    heartRate: heartRate.sort(byTime), workoutHeartRate: [...workoutHeartRate].sort(byTime),
-    heartRateCoverage: heartRateCoverage.sort((a, b) => a.start - b.start),
-    stress: stress.sort(byTime), steps: steps.sort(byTime),
-    restingByDate, sleeps: sleeps.sort((a, b) => a.start - b.start), observedMaxHeartRate,
+  const byStart = (a, b) => a.start - b.start;
+  // 拉到的样本立即并入缓冲整体重排，不能攒批：饿判读的是缓冲本身，批量合并会让饿循环在
+  // 同一轮把剩余文件全部拉完，缓冲退化成整段历史。
+  const pullFile = () => {
+    const extract = extractBodyBatterySamples(readRecord(path.join(dataDir, files[fileIndex++]), null));
+    heartRate.push(...extract.heartRate); heartRate.sort(byTime);
+    // 恢复心率按时间戳去重、后到的文件为准——与旧的全史 Map 同一条语义。
+    const deduped = new Map(workoutHeartRate.map((pair) => [pair[0], pair]));
+    for (const pair of extract.workoutHeartRate) deduped.set(pair[0], pair);
+    workoutHeartRate.length = 0; workoutHeartRate.push(...deduped.values()); workoutHeartRate.sort(byTime);
+    heartRateCoverage.push(...extract.heartRateCoverage); heartRateCoverage.sort(byStart);
+    stress.push(...extract.stress); stress.sort(byTime);
+    steps.push(...extract.steps); steps.sort(byTime);
+    sleeps.push(...extract.sleeps); sleeps.sort(byStart);
+    if (extract.resting !== null) { restingByDate.set(extract.date, extract.resting); restingDates.push(extract.date); restingDates.sort(); }
   };
+  const starved = (t) =>
+    (heartRate.length === 0 && maxTs.heartRate > t) || (workoutHeartRate.length === 0 && maxTs.workoutHeartRate > t)
+    || (heartRateCoverage.length === 0 && maxTs.heartRateCoverage > t) || (stress.length === 0 && maxTs.stress > t)
+    || (steps.length === 0 && maxTs.steps > t) || (sleeps.length === 0 && maxTs.sleeps > t);
+  const pump = (context) => {
+    // 拉取会重排缓冲：先按游标丢掉已消费的前缀再拉，丢弃数由调用方回退游标，「游标指向未消费
+    // 头部」的语义保持不变；此后每次 pullFile 都直接并进未消费尾部。
+    const cursors = context.cursors ?? { heartRate: 0, workoutHeartRate: 0, heartRateCoverage: 0, stress: 0, steps: 0, sleeps: 0 };
+    if (cursors.heartRate > 0) heartRate.splice(0, cursors.heartRate);
+    if (cursors.workoutHeartRate > 0) workoutHeartRate.splice(0, cursors.workoutHeartRate);
+    if (cursors.heartRateCoverage > 0) heartRateCoverage.splice(0, cursors.heartRateCoverage);
+    if (cursors.stress > 0) stress.splice(0, cursors.stress);
+    if (cursors.steps > 0) steps.splice(0, cursors.steps);
+    if (cursors.sleeps > 0) sleeps.splice(0, cursors.sleeps);
+    if (context.first) {
+      // 起点是第一个非小睡会话，把它拉到手为止；扁平 inputs（测试直接构造）没有这一步。
+      while (fileIndex < files.length && !sleeps.some((session) => !session.nap)) pullFile();
+    } else {
+      const through = context.wakingDate && context.wakingDate > context.date ? context.wakingDate : context.date;
+      while (fileIndex < files.length && files[fileIndex].slice(0, 10) <= through) pullFile();
+      while (fileIndex < files.length && starved(context.t)) pullFile();
+    }
+    return cursors;
+  };
+  return { heartRate, workoutHeartRate, heartRateCoverage, stress, steps, sleeps, restingByDate, restingDates, bounds, fromDate, pump };
 }
 
 // 睡眠阶段对充电速率的加权。深睡恢复最快；浅睡是基准速率（倍率 1.0），会话里没有阶段信息的时段
@@ -924,14 +997,21 @@ function sleepChargeMultiplier(stageKey, params) {
 // 缺必需基线时整段算不出来，返回 `{ uncomputable: { reason, date } }`，不抛异常。
 function walkBodyBattery(inputs, params) {
   const { heartRate, workoutHeartRate = [], heartRateCoverage = [], stress, steps = [], restingByDate, sleeps } = inputs;
-  const restingDates = [...restingByDate.keys()].sort();
-  const wakingDates = sleeps.map((session) => formatLocalDate(new Date(session.end)));
+  const pump = inputs.pump;
+  // 逐日拉取时先喂到第一个非小睡会话，起点才定得下来；直接构造的 inputs（测试）已整体在手。
+  pump?.({ first: true });
+  const restingDates = pump ? inputs.restingDates : [...restingByDate.keys()].sort();
   // 小睡不是一夜：负荷曲线不从它起算，也不由它收尾。
   const nights = sleeps.filter((session) => !session.nap);
   const start = nights[0].start;
-  const end = Math.max(heartRate.at(-1)?.[0] ?? 0, workoutHeartRate.at(-1)?.[0] ?? 0, stress.at(-1)?.[0] ?? 0,
+  // 直接构造的 inputs 在这里算终点；逐日拉取时终点是拉取前的全史扫描给出的标量——最后一段
+  // 区间必须精确落在终点上，而「最后一条读数在哪」只有看完全部文件才知道。
+  const end = pump ? inputs.bounds.end : Math.max(heartRate.at(-1)?.[0] ?? 0, workoutHeartRate.at(-1)?.[0] ?? 0, stress.at(-1)?.[0] ?? 0,
     ...nights.map((session) => session.end), heartRateCoverage.reduce((latest, interval) => Math.max(latest, interval.end), 0));
   const curveMs = params.curve_interval_minutes * MINUTE_MS;
+  // 展示窗口之外的点只算不存：积分链照走，curve/events/days 不攒窗口外的历史。
+  const fromDate = inputs.fromDate ?? null;
+  const fromMs = fromDate === null ? -Infinity : localDateStart(fromDate, formatLocalDate);
   let level = params.initial_level;
   let hrIndex = 0; let workoutIndex = 0; let coverageIndex = 0; let stressIndex = 0; let sleepIndex = 0; let restingIndex = -1; let stepIndex = 0;
   let lastHr = null; let lastWorkoutHr = null; let lastStress = null; let lastStep = null; let silentSince = null;
@@ -942,13 +1022,29 @@ function walkBodyBattery(inputs, params) {
   let intervalEstimated = false;
   const estimation = { minutes: 0, charged: 0, drained: 0 };
   const contributions = {};
-  const days = new Map(); const curve = [{ t: start, level, estimated: false, interval_estimated: false }]; const events = []; const open = {};
+  const curve = start >= fromMs ? [{ t: start, level, estimated: false, interval_estimated: false }] : [];
+  const days = new Map(); const events = []; const open = {};
   const close = (run, endMs, to) => {
     if (run.type === "high_stress" && endMs - run.start < params.high_stress_min_minutes * MINUTE_MS) return;
-    events.push({ type: run.type, start: run.start, end: endMs, change: round1(to - run.from), ...(run.reason ? { reason: run.reason } : {}) });
+    if (endMs >= fromMs) events.push({ type: run.type, start: run.start, end: endMs, change: round1(to - run.from), ...(run.reason ? { reason: run.reason } : {}) });
   };
+  // 拉取一批新文件会重排缓冲：按返回的丢弃数把游标回退，「游标指向未消费头部」的语义保持不变。
+  const feed = (context) => {
+    if (!pump) return;
+    const drops = pump({ ...context, cursors: { heartRate: hrIndex, workoutHeartRate: workoutIndex, heartRateCoverage: coverageIndex, stress: stressIndex, steps: stepIndex, sleeps: sleepIndex } });
+    if (drops) {
+      hrIndex -= drops.heartRate; workoutIndex -= drops.workoutHeartRate; coverageIndex -= drops.heartRateCoverage;
+      stressIndex -= drops.stress; stepIndex -= drops.steps; sleepIndex -= drops.sleeps;
+    }
+  };
+  // 醒来日的本地日期；夜里的静息心率按它取。逐日拉取时抽取已带，直接构造的 inputs 现算。
+  const wakingDateOf = (session) => session.wakingDate ?? formatLocalDate(new Date(session.end));
 
   for (let t = start; t < end;) {
+    // 当地日期跨过午夜才推进，两个日期分支都不再依赖切分粒度或时区偏移。推进要先于拉取：
+    // 新一天文件的静息心率必须先于 resting 查找到位，next 对新样本的收窄也一样。
+    if (t >= midnightMs) { date = formatLocalDate(new Date(t)); midnightMs = localDateStart(addDays(date, 1), formatLocalDate); }
+    feed({ t, date });
     while (hrIndex < heartRate.length && heartRate[hrIndex][0] <= t) lastHr = heartRate[hrIndex++];
     while (workoutIndex < workoutHeartRate.length && workoutHeartRate[workoutIndex][0] <= t) lastWorkoutHr = workoutHeartRate[workoutIndex++];
     while (coverageIndex < heartRateCoverage.length && heartRateCoverage[coverageIndex].end <= t) coverageIndex += 1;
@@ -963,8 +1059,8 @@ function walkBodyBattery(inputs, params) {
     // 会话内当前时刻落在哪个阶段；阶段之间没有覆盖到的空隙是 null。
     const stage = night === null ? null : night.stages.find(([from, to]) => from <= t && t < to) || null;
     const asleep = night !== null && stage?.[2] !== "awake_min";
-    // 当地日期跨过午夜才推进，两个日期分支都不再依赖切分粒度或时区偏移。
-    if (t >= midnightMs) { date = formatLocalDate(new Date(t)); midnightMs = localDateStart(addDays(date, 1), formatLocalDate); }
+    // 夜里的静息心率按醒来日取：会话存在醒来日的文件里，先把那个文件拉到位再查 resting。
+    if (night !== null) feed({ t, date, wakingDate: wakingDateOf(night) });
     while (restingIndex + 1 < restingDates.length && restingDates[restingIndex + 1] <= date) restingIndex += 1;
 
     const workoutExpires = lastWorkoutHr === null ? t : lastWorkoutHr[0] + params.workout_heart_rate_hold_seconds * 1000;
@@ -1015,13 +1111,13 @@ function walkBodyBattery(inputs, params) {
       state = gapReason; delta = -params.low_intensity_drain_per_minute;
     } else {
       // 睡眠会话（含夜醒）取醒来日静息心率，清醒区间沿用当日或最近历史值；小睡按清醒区间取。
-      const restingDate = night ? wakingDates[sleepIndex] : restingDates[restingIndex];
+      const restingDate = night ? wakingDateOf(night) : restingDates[restingIndex];
       const resting = restingByDate.get(restingDate);
       // 需要心率储备却没有基线时不默认一个静息心率，也不返回假装确定的电量：整段历史没法算，
       // 直接把缺哪一天报出去，交给调用方判断（与训练负荷的 uncomputable 同一种降级）。
-      if (resting === undefined) return { uncomputable: { reason: "missing_resting_heart_rate", date: night ? wakingDates[sleepIndex] : date } };
+      if (resting === undefined) return { uncomputable: { reason: "missing_resting_heart_rate", date: night ? wakingDateOf(night) : date } };
       // 最大心率不高于静息心率时公式没有定义域（除零或负分母），与训练负荷同一条降级。
-      if (!(params.max_heart_rate > resting)) return { uncomputable: { reason: "invalid_heart_rate_range", date: night ? wakingDates[sleepIndex] : date } };
+      if (!(params.max_heart_rate > resting)) return { uncomputable: { reason: "invalid_heart_rate_range", date: night ? wakingDateOf(night) : date } };
       // 噪点心率会推出 reserve > 1，按公式定义域截到 [0, 1]，不给活动耗电留无上限的放大。
       const reserve = Math.min(1, Math.max(0, (selectedHr[1] - resting) / (params.max_heart_rate - resting)));
       if (!stressFresh && !asleep) gapReason = "stress_unavailable";
@@ -1080,18 +1176,21 @@ function walkBodyBattery(inputs, params) {
     const before = level; const minutes = (next - t) / MINUTE_MS;
     level = Math.min(params.max_level, Math.max(params.min_level, level + delta * minutes));
     const charged = Math.max(0, level - before); const drained = Math.max(0, before - level);
-    if (!days.has(date)) days.set(date, { date, max: before, min: before, charged: 0, drained: 0, estimated_minutes: 0 });
-    const day = days.get(date);
-    day.max = Math.max(day.max, level); day.min = Math.min(day.min, level);
-    day.charged += charged; day.drained += drained;
+    if (fromDate === null || date >= fromDate) {
+      if (!days.has(date)) days.set(date, { date, max: before, min: before, charged: 0, drained: 0, estimated_minutes: 0 });
+      const day = days.get(date);
+      day.max = Math.max(day.max, level); day.min = Math.min(day.min, level);
+      day.charged += charged; day.drained += drained;
+      if (gapReason !== null) day.estimated_minutes += minutes;
+    }
     if (!contributions[state]) contributions[state] = { minutes: 0, charged: 0, drained: 0 };
     contributions[state].minutes += minutes; contributions[state].charged += charged; contributions[state].drained += drained;
     if (gapReason !== null) {
       estimation.minutes += minutes; estimation.charged += charged; estimation.drained += drained;
-      day.estimated_minutes += minutes; intervalEstimated = true;
+      intervalEstimated = true;
     }
     if (next % curveMs === 0 || next === end) {
-      curve.push({ t: next, level, estimated: estimation.minutes > 0, interval_estimated: intervalEstimated });
+      if (next >= fromMs) curve.push({ t: next, level, estimated: estimation.minutes > 0, interval_estimated: intervalEstimated });
       intervalEstimated = false;
     }
     t = next;
@@ -1107,18 +1206,19 @@ function formatBodyBatteryClock(ms) {
 
 function bodyBattery(dataDir, days) {
   const params = { ...JSON.parse(fs.readFileSync(BODY_BATTERY_PARAMS_PATH, "utf8")), max_heart_rate: readMaxHeartRate() };
-  const inputs = readBodyBatteryInputs(dataDir);
+  // 先扫一遍全史拿标量档案（终点、观测最大心率、有没有夜睡），再逐日拉取、边拉边喂：
+  // 驻留只有单日缓冲与展示窗口，与历史年限无关。补传、修正和参数改动照旧每次调用立即生效。
+  const bounds = scanBodyBatteryHistory(dataDir);
   // The walk starts at the first night's sleep; before one is on record there is no battery yet.
   // 记录里只有小睡、一次夜睡都没有的库也属这一类——小睡不是一夜，不从它建曲线。
-  if (!inputs.sleeps.some((session) => !session.nap)) return null;
-  const walk = walkBodyBattery(inputs, params);
-  // 整段历史算不出来时只有缺什么这一件事可说，没有可以逐日降级的部分——电量是一条连续曲线。
-  if (walk.uncomputable) return { status: "uncomputable", ...walk.uncomputable };
+  if (!bounds.hasNight) return null;
   // The history is always walked whole; `days` only picks how many local days of it are shown.
   const since = new Date();
   since.setDate(since.getDate() - (days - 1));
   const fromDate = formatLocalDate(since);
-  const shown = (ms) => formatLocalDate(new Date(ms)) >= fromDate;
+  const walk = walkBodyBattery(bodyBatteryFeed(dataDir, bounds, fromDate), params);
+  // 整段历史算不出来时只有缺什么这一件事可说，没有可以逐日降级的部分——电量是一条连续曲线。
+  if (walk.uncomputable) return { status: "uncomputable", ...walk.uncomputable };
   const rounded = (values) => Object.fromEntries(Object.entries(values).map(([key, value]) => [key, round1(value)]));
   return {
     level: Math.round(walk.level),
@@ -1128,10 +1228,10 @@ function bodyBattery(dataDir, days) {
     estimation: rounded(walk.estimation),
     contributions: Object.fromEntries(Object.entries(walk.contributions).map(([key, values]) => [key, rounded(values)])),
     max_heart_rate_setting: params.max_heart_rate,
-    observed_max_heart_rate: inputs.observedMaxHeartRate,
-    daily: walk.days.filter((day) => day.date >= fromDate).map((day) => ({ date: day.date, max: Math.round(day.max), min: Math.round(day.min), charged: Math.round(day.charged), drained: Math.round(day.drained), estimated_minutes: round1(day.estimated_minutes) })),
-    events: walk.events.filter((event) => shown(event.end)).map((event) => ({ type: event.type, start: formatBodyBatteryClock(event.start), end: formatBodyBatteryClock(event.end), change: event.change, ...(event.reason ? { reason: event.reason } : {}) })),
-    curve: walk.curve.filter((point) => shown(point.t)).map((point) => ({ time: formatBodyBatteryClock(point.t), level: Math.round(point.level), ...(point.estimated ? { estimated: true } : {}), ...(point.interval_estimated ? { interval_estimated: true } : {}) })),
+    observed_max_heart_rate: bounds.observedMaxHeartRate,
+    daily: walk.days.map((day) => ({ date: day.date, max: Math.round(day.max), min: Math.round(day.min), charged: Math.round(day.charged), drained: Math.round(day.drained), estimated_minutes: round1(day.estimated_minutes) })),
+    events: walk.events.map((event) => ({ type: event.type, start: formatBodyBatteryClock(event.start), end: formatBodyBatteryClock(event.end), change: event.change, ...(event.reason ? { reason: event.reason } : {}) })),
+    curve: walk.curve.map((point) => ({ time: formatBodyBatteryClock(point.t), level: Math.round(point.level), ...(point.estimated ? { estimated: true } : {}), ...(point.interval_estimated ? { interval_estimated: true } : {}) })),
   };
 }
 
@@ -1458,7 +1558,7 @@ module.exports = {
   formatLocalDate,
   mergeHealthData,
   normalizeSleepSession,
-  readBodyBatteryInputs,
+  extractBodyBatterySamples,
   readHealthRecords,
   readHealthToolResult,
   readProfile,

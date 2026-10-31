@@ -6,7 +6,7 @@ const path = require("node:path");
 const { Client } = require("@modelcontextprotocol/sdk/client/index.js");
 const { InMemoryTransport } = require("@modelcontextprotocol/sdk/inMemory.js");
 
-const { buildSummaryText, createApp, createHealthMcpServer, cycleContextForDate, dailySummary, formatLocalDate, mergeHealthData, normalizeSleepSession, readBodyBatteryInputs, readHealthRecords, readHealthToolResult, readProfile, storeCycleConfig, walkBodyBattery } = require("./health-server");
+const { buildSummaryText, createApp, createHealthMcpServer, cycleContextForDate, dailySummary, formatLocalDate, mergeHealthData, normalizeSleepSession, extractBodyBatterySamples, readHealthRecords, readHealthToolResult, readProfile, storeCycleConfig, walkBodyBattery } = require("./health-server");
 
 function tmpDataDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "health-mcp-test-"));
@@ -1065,7 +1065,8 @@ test("只有清醒阶段、或打了 nap 阶段都标成小睡，没有阶段信
     { session_start_time: "2026-09-06T14:00:00+08:00", session_end_time: "2026-09-06T14:20:00+08:00", duration_seconds: 1200, stages: [{ stage: "awake", start_time: "2026-09-06T14:00:00+08:00", end_time: "2026-09-06T14:20:00+08:00", duration_seconds: 1200 }] },
     { session_start_time: "2026-09-06T16:00:00+08:00", session_end_time: "2026-09-06T16:40:00+08:00", duration_seconds: 2400, stages: [] },
   ] });
-  assert.deepEqual(readBodyBatteryInputs(dir).sleeps.map((session) => session.nap), [false, true, true, false], "小睡留在列表里并带标记，没有阶段信息的会话不判小睡");
+  const record = JSON.parse(fs.readFileSync(path.join(dir, "2026-09-06.json"), "utf8"));
+  assert.deepEqual(extractBodyBatterySamples(record).sleeps.map((session) => session.nap), [false, true, true, false], "小睡留在列表里并带标记，没有阶段信息的会话不判小睡");
 });
 
 test("小睡不按睡眠速率充电，也不产生睡眠事件", (t) => {
