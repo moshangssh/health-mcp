@@ -103,17 +103,19 @@ curl http://127.0.0.1:3100/healthz   # 返回 {"ok":true,...}
 新增 `interval_estimated` 表示从上一绘图点到该点的区间是否包含缺测。顶层 `estimation` 给出全历史
 估算的 `minutes`、`charged`、`drained`；这不是置信区间，也不等于最终分数的误差。
 `contributions` 按 `sleep_recovery`、`rest_recovery`、`activity`、`stress`、`unworn`、`heart_rate_missing`、
-`heart_rate_unavailable`、`stress_unavailable` 给出互斥的分钟数和实际充耗电贡献；事件可能相互重叠，不能再把事件变化相加。
+`heart_rate_unavailable`、`stress_unavailable`、`sync_gap` 给出互斥的分钟数和实际充耗电贡献；事件可能相互重叠，不能再把事件变化相加。
 `estimation` 是这些贡献中的估算部分，不能另外加到收支上。两者始终包含全历史，不随显示天数截断。
 
 `data_gap` 事件带 `reason`：`heart_rate_missing` 表示原始历史已取得但无有效
 心率；`heart_rate_unavailable` 表示没有可用心率且没有明确的缺测覆盖证据；`stress_unavailable`
-表示心率可用但压力过期或缺失。活动期间压力缺失也会注明估算。
+表示清醒且非活动时心率可用，但压力过期或缺失。活动仅按有效心率计算，睡眠恢复按阶段计算，两者不因压力缺失而注明估算。
+`sync_gap` 表示无心率、无步数活动的连续静默已达到 `unworn_max_minutes`（默认 300 分钟）。
 
 手环没有离腕模式，只能从数据推断：**既没有有效期内的普通/运动心率读数，也没有步数活动**，
 两条证据同时缺失即为疑似的未佩戴。为避免瞬时抖动误判，静默需连续达到 `unworn_min_minutes`
 （默认 60 分钟）才转为 `unworn` 事件；期间的缺测仍按低强度速率估算，转为 `unworn` 后电量保持在
-当时的值，既不充电也不消耗，也不计入缺测估算。重新出现心率或步数活动即结束该事件。
+当时的值，既不充电也不消耗，也不计入缺测估算。`observed` 覆盖表示手环仍在测量，此时不判未佩戴；
+静默达到 `unworn_max_minutes` 后转为 `sync_gap`，按低强度耗电估算。重新出现心率或步数活动即结束该事件。
 
 算法从有记录的第一晚入睡开始，**从不按天重置**，所以每次调用都会重算全部历史，
 `days` / `time_range` 只决定输出显示多少天。区间按新读数、读数过期、覆盖区间、每个睡眠阶段的边界、
@@ -137,27 +139,29 @@ curl http://127.0.0.1:3100/healthz   # 返回 {"ok":true,...}
    没有可用心率时，按低强度速率估算耗电；
 3. 心率储备（`(心率 − 静息心率) / (最大心率 − 静息心率)`，按公式定义域截到 `[0, 1]`，噪点读数
    不会推出无上限的耗电）高于 0.3 → 活动耗电取
-   `max(低强度耗电速率, 活动系数 × 超出阈值的储备比例)`；若还有有效的净压力耗电，再取二者较大值，
-   不叠加。进入活动即作废运动前的压力读数——运动一开始，运动前测得的恢复态就被打破，运动期间到达
-   的样本也不是恢复态——之后要有新样本才回到压力分支，缺口期间按低强度耗电。高频和普通心率重叠时只用一个值；
-4. 没有压力读数，或最近一次读数已满 30 分钟 → 按低强度耗电；
-5. 否则使用局部连续压力映射。设阈值 `T = stress_threshold`、过渡半宽 `w = stress_transition_half_width`，
+   `max(低强度耗电速率, 活动系数 × 超出阈值的储备比例)`，仅由心率决定。
+   判定活动后、计算本段耗电和事件之前即作废压力读数；运动期间到达的压力读数同样不用于恢复或高压力事件。
+   活动结束后须新的压力读数才回到清醒压力分支，此前按低强度耗电估算。高频和普通心率重叠时只用一个值；
+4. 夜睡会话内、当前阶段不是清醒 → 充电基准速率为 `sleep_charge_per_minute`（默认 0.5），再乘阶段倍率和剩余容量倍率。
+   深睡倍率为 `deep_sleep_charge_multiplier`（默认 1.2），浅睡为 `light_sleep_charge_multiplier`，REM 为
+   `rem_sleep_charge_multiplier`（两者默认 1.0）。没有阶段信息、或阶段未覆盖的空隙按浅睡倍率算。
+   睡眠充电不使用压力分；夜醒按后面的清醒规则计算；
+5. 清醒且非活动时没有压力读数，或最近一次读数已满 `stress_hold_minutes`（默认 30 分钟） → 按低强度耗电估算；
+6. 否则使用局部连续压力映射。设阈值 `T = stress_threshold`、过渡半宽 `w = stress_transition_half_width`，
    `q = clamp((压力 − T + w) / (2w), 0, 1)`；恢复分支为
-   `C = max(T − 压力, 0) × 恢复系数`（睡眠与清醒系数不同，睡眠再按阶段加权），耗损分支为
+   `C = max(T − 压力, 0) × rest_charge_per_stress_point × 剩余容量倍率`，耗损分支为
    `D = 压力 × stress_drain_per_stress_point`，净变化率为 `(1−q) × C − q × D`。
    默认仅在 25–35 压力分范围混合，两侧严格保持原公式；30 不再是跳变点，也不被假定为零变化点。
-   睡眠中 `C = max(T − 压力, 0) × sleep_charge_per_stress_point × 阶段倍率`，倍率按当前所处阶段取：
-   深睡 `deep_sleep_charge_multiplier`（默认 1.2）、浅睡 `light_sleep_charge_multiplier`、REM
-   `rem_sleep_charge_multiplier`（两者默认 1.0）。手环不分阶段的会话、以及阶段没覆盖到的空隙都按浅睡倍率算，
-   所以默认值下只有深睡阶段比引入阶段加权之前充得快。清醒阶段仍用 `rest_charge_per_stress_point`，不加倍率。
-   两条恢复分支的 `C` 还都要乘一个剩余容量倍率：`charge_saturation_floor + (1 − charge_saturation_floor)
-   × max(0, (charge_saturation_target − 电量) / (charge_saturation_target − min_level))`，电量取该段区间
-   起点的值。倍率在点数下限处正好是 1、在 `charge_saturation_target`（默认 90）处降到
-   `charge_saturation_floor`（默认 0），电量到达目标之后充电项就是 0，只剩耗电。收敛点由目标钉住，
-   不再像纯线性阻尼那样恒在天花板上，所以再长的低压力夜晚也顶不到上限，只会向目标渐近。
-   `charge_saturation_floor` 取 1 等于关掉阻尼（倍率恒为 1，与引入它之前的线性充电逐位一致），
-   取大于 0 则收敛点落在目标之上。积分因此是线性递推而不是直线：一段区间里的充电量由该区间起点的
-   电量决定，`sleep_charge_per_stress_point` 只决定逼近目标的快慢。
+
+睡眠与清醒恢复共用剩余容量倍率：`G(L) = f + (1 − f) × max(0, (S − L) / (S − M))`，其中
+`f = charge_saturation_floor`（默认 0）、`S = charge_saturation_target`（默认 90）、`M = min_level`。
+倍率在下限处为 1、到目标处降至 `f`。默认 `f = 0` 时睡眠向目标渐近；`f = 1` 时恒速充电；
+`f > 0` 时到达目标仍有残余充电，可以继续升至电量上限。
+
+每段按 `dL/dt = c × G(L) − d` 的解析解积分：`c` 是未乘阻尼的充电速率，`d` 是耗电速率。
+默认 `f = 0`、起点低于目标且没有耗电的睡眠段，结束电量为 `S − (S − L起点) × exp(−c × 分钟数 / (S − M))`。
+清醒的恢复与压力耗损同时按该方程积分；跨充电目标时按穿越时刻分段，最终收支受电量上下限约束。
+因此同一段状态无论增加无关采样点、午夜边界或绘图点，最终电量与收支都相同，仅有浮点计算尾差。
 
 读数的有效期统一为 `[读数时间, 读数时间 + 保留时长)`，到期就不再沿用。积分终点由最后心率、压力、
 睡眠结束或已取得活动历史覆盖终点确定，不外推至服务器当前时钟。恢复心率可超过运动的 `end_time`，

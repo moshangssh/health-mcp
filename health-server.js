@@ -991,9 +991,37 @@ function sleepChargeMultiplier(stageKey, params) {
   return params.light_sleep_charge_multiplier;
 }
 
+// dL/dt = chargeRate × G(L) − drainRate。目标以下是线性微分方程，目标以上是恒速；
+// 穿越目标时按解析的穿越时刻分段，因此增加绘图点或无关读数不改变积分结果。
+function integrateBodyBattery(level, minutes, chargeRate, drainRate, params) {
+  const target = params.charge_saturation_target;
+  const decay = chargeRate * (1 - params.charge_saturation_floor) / (target - params.min_level);
+  const targetRate = chargeRate * params.charge_saturation_floor - drainRate;
+  const belowTarget = (initial, duration) => initial
+    + (targetRate + decay * (target - initial)) * -Math.expm1(-decay * duration) / decay;
+  let next;
+  if (decay === 0) {
+    // 充电速率为零或 floor=1 时，方程本身就是恒速充放电。
+    next = level + targetRate * minutes;
+  } else if (level >= target) {
+    if (targetRate < 0 && level + targetRate * minutes < target) {
+      const crossingMinutes = (target - level) / targetRate;
+      next = belowTarget(target, minutes - crossingMinutes);
+    } else {
+      next = level + targetRate * minutes;
+    }
+  } else if (targetRate > 0) {
+    const crossingMinutes = Math.log1p(decay * (target - level) / targetRate) / decay;
+    next = minutes > crossingMinutes ? target + targetRate * (minutes - crossingMinutes) : belowTarget(level, minutes);
+  } else {
+    next = belowTarget(level, minutes);
+  }
+  return Math.min(params.max_level, Math.max(params.min_level, next));
+}
+
 // 从第一晚入睡积分到最后一条数据，始终计算 [t, next) 的实际时长。
 // 状态点表示已经积分到该时刻；切分点只有数据驱动的边界（新读数、读数过期、覆盖区间、
-// 睡眠阶段、离腕判定、曲线点、当地午夜），不按整分钟切分——积分是线性的，那是纯多余的迭代。
+// 睡眠阶段、离腕判定、曲线点、当地午夜），每段按解析解积分，不按整分钟切分。
 // 缺必需基线时整段算不出来，返回 `{ uncomputable: { reason, date } }`，不抛异常。
 function walkBodyBattery(inputs, params) {
   const { heartRate, workoutHeartRate = [], heartRateCoverage = [], stress, steps = [], restingByDate, sleeps } = inputs;
@@ -1074,7 +1102,7 @@ function walkBodyBattery(inputs, params) {
     const hrFresh = selectedHr !== null;
     const hrExpires = workoutFresh ? workoutExpires : ordinaryExpires;
     const stressExpires = lastStress === null ? t : lastStress[0] + params.stress_hold_minutes * MINUTE_MS;
-    const stressFresh = t < stressExpires;
+    let stressFresh = t < stressExpires;
     // 手环没有离腕模式：无心率读数、且阈值内也没有步数活动，两条证据都缺失。短暂的抖动不判离腕，
     // 静默连续超过 unworn_min_minutes 才认定为未佩戴。coverage=observed 的时段手环在测，静默只是
     // 样本没传上来（断联/上传滞后），不算离腕——静默计时照旧累计，observed 只挡住判定。
@@ -1087,28 +1115,29 @@ function walkBodyBattery(inputs, params) {
     // 摘表（充电/洗澡）罕见超过几小时，静默拖过 unworn_max_minutes 之外剩下的只能是断联缺测。
     const syncGap = silentSince !== null && t - silentSince >= params.unworn_max_minutes * MINUTE_MS;
     // 剩余容量阻尼：充电倍率在点数下限处是 1，到 charge_saturation_target 处降到 charge_saturation_floor，
-    // 目标之上不再有充电项（定义域截断，同 reserve 与 hrRatio 的写法）。用区间起点的 level——积分是
-    // 线性递推而不是直线，一段足够长的睡眠仍会向目标逼近，只是越来越慢。
+    // 默认 floor=0 时目标之上不再充电。区间起点的净速率只用于区分恢复/压力状态，
+    // 实际充耗电由 integrateBodyBattery 对充电和耗电系数一起精确积分。
     const saturation = params.charge_saturation_floor + (1 - params.charge_saturation_floor) * Math.max(0, (params.charge_saturation_target - level) / (params.charge_saturation_target - params.min_level));
     // 只平滑阈值附近：区间外保持原恢复/耗损速率，不整体平移高压力区的消耗。压力块只算清醒时段。
     let pressureDelta = 0;
+    let pressureChargeRate = 0; let pressureDrainRate = 0;
     if (!asleep && stressFresh) {
       const score = lastStress[1];
-      const charge = params.rest_charge_per_stress_point * Math.max(0, params.stress_threshold - score) * saturation;
       const weight = Math.min(1, Math.max(0, (score - params.stress_threshold + params.stress_transition_half_width) / (2 * params.stress_transition_half_width)));
-      pressureDelta = (1 - weight) * charge - weight * params.stress_drain_per_stress_point * score;
+      pressureChargeRate = (1 - weight) * params.rest_charge_per_stress_point * Math.max(0, params.stress_threshold - score);
+      pressureDrainRate = weight * params.stress_drain_per_stress_point * score;
+      pressureDelta = pressureChargeRate * saturation - pressureDrainRate;
     }
-    const stressDrain = Math.max(0, -pressureDelta);
-    let state; let delta; let gapReason = null;
+    let state; let chargeRate = 0; let drainRate = 0; let gapReason = null;
     if (syncGap) {
       // 断联缺测：静默远超摘表可能，按低强度耗损估算并计入 estimated（同文件内缺口的语义），不再冻结。
-      gapReason = "sync_gap"; state = gapReason; delta = -params.low_intensity_drain_per_minute;
+      gapReason = "sync_gap"; state = gapReason; drainRate = params.low_intensity_drain_per_minute;
     } else if (unworn) {
       // 离腕期间电量保持不变，既不充电也不消耗，也不计入缺测估算。
-      state = "unworn"; delta = 0;
+      state = "unworn";
     } else if (!hrFresh) {
       gapReason = coverage?.status === "missing" ? "heart_rate_missing" : "heart_rate_unavailable";
-      state = gapReason; delta = -params.low_intensity_drain_per_minute;
+      state = gapReason; drainRate = params.low_intensity_drain_per_minute;
     } else {
       // 睡眠会话（含夜醒）取醒来日静息心率，清醒区间沿用当日或最近历史值；小睡按清醒区间取。
       const restingDate = night ? wakingDateOf(night) : restingDates[restingIndex];
@@ -1120,17 +1149,19 @@ function walkBodyBattery(inputs, params) {
       if (!(params.max_heart_rate > resting)) return { uncomputable: { reason: "invalid_heart_rate_range", date: night ? wakingDateOf(night) : date } };
       // 噪点心率会推出 reserve > 1，按公式定义域截到 [0, 1]，不给活动耗电留无上限的放大。
       const reserve = Math.min(1, Math.max(0, (selectedHr[1] - resting) / (params.max_heart_rate - resting)));
-      if (!stressFresh && !asleep) gapReason = "stress_unavailable";
       if (reserve > params.activity_reserve_threshold) {
-        const activityDrain = Math.max(params.low_intensity_drain_per_minute, params.activity_drain_per_reserve * (reserve - params.activity_reserve_threshold));
-        state = "activity"; delta = -Math.max(activityDrain, stressDrain);
+        // 活动只使用心率。先作废压力，再生成本段事件；活动期间的新压力也不能留作恢复依据。
+        lastStress = null; stressFresh = false;
+        state = "activity";
+        drainRate = Math.max(params.low_intensity_drain_per_minute, params.activity_drain_per_reserve * (reserve - params.activity_reserve_threshold));
       } else if (!stressFresh && !asleep) {
-        state = "stress_unavailable"; delta = -params.low_intensity_drain_per_minute;
+        gapReason = "stress_unavailable"; state = gapReason; drainRate = params.low_intensity_drain_per_minute;
       } else {
         // 睡眠恢复由阶段和时长驱动（见 sleepChargeMultiplier 的注释），压力缺失同样照充，不缺测；
         // 清醒两支沿用上面的压力块。
         state = asleep ? "sleep_recovery" : pressureDelta > 0 ? "rest_recovery" : "stress";
-        delta = asleep ? sleepChargeMultiplier(stage?.[2], params) * params.sleep_charge_per_minute * saturation : pressureDelta;
+        chargeRate = asleep ? sleepChargeMultiplier(stage?.[2], params) * params.sleep_charge_per_minute : pressureChargeRate;
+        drainRate = asleep ? 0 : pressureDrainRate;
       }
     }
 
@@ -1167,14 +1198,8 @@ function walkBodyBattery(inputs, params) {
       }
     } else if (sleepIndex < sleeps.length) next = Math.min(next, sleeps[sleepIndex].start);
 
-    // 运动一开始，运动前测得的恢复态即被打破：作废那个读数，也不再拿运动期间到达的读数
-    // 顶替（运动中的手环压力分不是恢复态）。之后储备仍高就继续活动耗电；储备回落又没有新
-    // 读数时由 stressFresh 自然转假，走低强度耗电，直到运动结束后有新样本才回到压力分支。
-    // 放在本轮的 flags 与 next 之后：两者还要用这一轮已经算好的 stressFresh 和 lastStress。
-    if (state === "activity") lastStress = null;
-
     const before = level; const minutes = (next - t) / MINUTE_MS;
-    level = Math.min(params.max_level, Math.max(params.min_level, level + delta * minutes));
+    level = integrateBodyBattery(level, minutes, chargeRate, drainRate, params);
     const charged = Math.max(0, level - before); const drained = Math.max(0, before - level);
     if (fromDate === null || date >= fromDate) {
       if (!days.has(date)) days.set(date, { date, max: before, min: before, charged: 0, drained: 0, estimated_minutes: 0 });

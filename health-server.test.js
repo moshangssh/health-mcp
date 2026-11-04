@@ -911,17 +911,18 @@ function batteryInputs({ heartRate, workoutHeartRate = [], heartRateCoverage = [
   return { heartRate, workoutHeartRate, heartRateCoverage, stress, steps, restingByDate, sleeps: withStages, observedMaxHeartRate: 0 };
 }
 
-// 剩余容量阻尼把充电变成线性递推：一段区间按它起点的电量取倍率，L′ = L + 速率 × 分钟数 × 倍率。
-// `[]` 里是 [分钟数, 每分钟充多少分]，段界与 walk 实际走到的那几个切分点一一对应。
-const saturation = (level, params = BB_PARAMS) => params.charge_saturation_floor + (1 - params.charge_saturation_floor) * Math.max(0, (params.charge_saturation_target - level) / (params.charge_saturation_target - params.min_level));
+// 默认 floor=0 的独立解析期望；同速区间任意切分都应得到相同结果。
+// 每段是 [分钟数, 未乘阻尼的充电速率]，floor=1 则是恒速充电。
 function chargeFor(segments, level = BB_PARAMS.initial_level, params = BB_PARAMS) {
-  for (const [minutes, rate] of segments) level += rate * minutes * saturation(level, params);
+  for (const [minutes, rate] of segments) {
+    level += params.charge_saturation_floor === 1 ? rate * minutes
+      : Math.max(0, params.charge_saturation_target - level) * -Math.expm1(-rate * minutes / (params.charge_saturation_target - params.min_level));
+  }
   return level;
 }
 const minuteSegments = (count, rate) => Array.from({ length: count }, () => [1, rate]);
 // contributions 按 0.1 取整后给出，比对时的容差取半个取整步长。
 const nearRounded1 = (actual, expected) => assert.ok(Math.abs(actual - expected) <= 0.05 + 1e-9, `实际 ${actual}，预期 ${expected}`);
-// 阻尼让速率随电量变，积分因此不再与切分网格无关；网格不同的两份输入只能在网格级尾差内相等。
 const nearWithin = (actual, expected, tolerance) => assert.ok(Math.abs(actual - expected) <= tolerance, `实际 ${actual}，预期 ${expected}（容差 ${tolerance}）`);
 
 test("a calm night charges the battery, slower in its awake stages", () => {
@@ -999,19 +1000,18 @@ test("落盘的睡眠阶段进 walk，深睡那一半按倍率充", (t) => {
   // 充/耗电按 0.1 取整后给出，避开整段电量在 .5 上取整的边界。
   const charged = readHealthToolResult(dir, { data_type: "body_battery", time_range: "today" }).body_battery.contributions.sleep_recovery.charged;
   nearRounded1(charged, chargeFor([...minuteSegments(60, deep), ...minuteSegments(180, light)]) - BB_PARAMS.initial_level);
-  assert.ok(charged > chargeFor(minuteSegments(240, light)) - BB_PARAMS.initial_level, "整段按浅睡算只有 30，深睡那一小时要多充出来");
+  assert.ok(charged > chargeFor(minuteSegments(240, light)) - BB_PARAMS.initial_level, "深睡那一小时比浅睡充得更多");
 });
 
-test("剩余容量阻尼：下限处按满速充，接近目标时按该处的倍率充", () => {
+test("剩余容量阻尼：从下限和接近目标处按解析曲线充电", () => {
   const rate = BB_PARAMS.sleep_charge_per_minute;
   const nearTarget = BB_PARAMS.charge_saturation_target - 10;
   const oneMinute = (initialLevel, params = BB_PARAMS) => walkBodyBattery(batteryInputs({
     heartRate: readings(0, 1, 1, 50), stress: [[at(0), 25]],
     sleeps: [{ start: at(0), end: at(1), awake: [] }],
   }), { ...params, initial_level: initialLevel }).level;
-  // 倍率是「下限处 1、目标处 floor」的一条直线：两个端点各钉一次，形状就不会被调歪。
-  near(oneMinute(BB_PARAMS.min_level), BB_PARAMS.min_level + rate);
-  near(oneMinute(nearTarget), nearTarget + rate * saturation(nearTarget));
+  near(oneMinute(BB_PARAMS.min_level), chargeFor([[1, rate]], BB_PARAMS.min_level));
+  near(oneMinute(nearTarget), chargeFor([[1, rate]], nearTarget));
 
   // 同一压力、同一时长，从接近目标处起充收到的量明显少于从下限起充。
   const night = (initialLevel, params = BB_PARAMS) => walkBodyBattery(batteryInputs({
@@ -1037,6 +1037,76 @@ test("电量到 charge_saturation_target 充电项就归零，越过目标不再
   assert.ok(night(target - 1) > target - 1 && night(target - 1) < target, "向目标是渐近逼近");
   // 归零点跟着 target 走：把目标抬到 95，原本停住的 92 又重新有充电项。
   assert.ok(night(target + 2, { ...BB_PARAMS, charge_saturation_target: 95 }) > target + 2, "目标抬高后同一电量重新开始充");
+});
+
+test("解析睡眠积分兼容默认阻尼、非零 floor 上穿目标和关闭阻尼后的上限收支", () => {
+  const minutes = 40; const initial = BB_PARAMS.charge_saturation_target - 1;
+  const rate = BB_PARAMS.sleep_charge_per_minute;
+  for (const floor of [0, 0.2, 1]) {
+    const decay = rate * (1 - floor) / (BB_PARAMS.charge_saturation_target - BB_PARAMS.min_level);
+    let expected;
+    if (floor === 1) {
+      expected = Math.min(BB_PARAMS.max_level, initial + rate * minutes);
+    } else if (floor === 0) {
+      expected = BB_PARAMS.charge_saturation_target - Math.exp(-decay * minutes);
+    } else {
+      const targetRate = rate * floor;
+      const crossing = Math.log1p(decay / targetRate) / decay;
+      assert.ok(crossing < minutes, "该案例确实跨过充电目标");
+      expected = BB_PARAMS.charge_saturation_target + targetRate * (minutes - crossing);
+    }
+    for (const curve_interval_minutes of [1, 15, 60]) {
+      for (const sampleMinutes of [1, 10, 15]) {
+        const walk = walkBodyBattery(batteryInputs({
+          heartRate: readings(0, minutes, sampleMinutes, 50),
+          sleeps: [{ start: at(0), end: at(minutes), stages: [] }],
+        }), { ...BB_PARAMS, initial_level: initial, charge_saturation_floor: floor, curve_interval_minutes });
+        near(walk.level, expected);
+        near(walk.contributions.sleep_recovery.minutes, minutes);
+        near(walk.contributions.sleep_recovery.charged, expected - initial);
+        near(walk.contributions.sleep_recovery.drained, 0);
+        near(walk.estimation.minutes, 0);
+      }
+    }
+  }
+});
+
+test("睡眠添加无关压力采样点不改变充电量", () => {
+  const input = batteryInputs({
+    heartRate: readings(0, 240, 10, 50),
+    sleeps: [{ start: at(0), end: at(240), stages: [] }],
+  });
+  const plain = walkBodyBattery(input, BB_PARAMS);
+  const dense = walkBodyBattery({ ...input, stress: readings(0, 240, 1, 100) }, BB_PARAMS);
+  near(plain.level, chargeFor([[240, BB_PARAMS.sleep_charge_per_minute]]));
+  near(dense.level, plain.level);
+  near(dense.contributions.sleep_recovery.charged, plain.contributions.sleep_recovery.charged);
+  near(dense.estimation.minutes, 0);
+});
+
+test("清醒混合压力从目标上方下穿目标，解析耗电与切分无关", () => {
+  const minutes = 40; const target = BB_PARAMS.charge_saturation_target;
+  const initial = target + 0.1; const floor = 0.2;
+  const score = BB_PARAMS.stress_threshold - BB_PARAMS.stress_transition_half_width * 0.7;
+  const weight = (score - BB_PARAMS.stress_threshold + BB_PARAMS.stress_transition_half_width) / (2 * BB_PARAMS.stress_transition_half_width);
+  const charge = (1 - weight) * BB_PARAMS.rest_charge_per_stress_point * (BB_PARAMS.stress_threshold - score);
+  const drain = weight * BB_PARAMS.stress_drain_per_stress_point * score;
+  const targetRate = charge * floor - drain;
+  const crossing = (target - initial) / targetRate;
+  assert.ok(targetRate < 0 && crossing > 0 && crossing < minutes, "该案例确实从上方下穿目标");
+  const decay = charge * (1 - floor) / (target - BB_PARAMS.min_level);
+  const expected = target + targetRate * -Math.expm1(-decay * (minutes - crossing)) / decay;
+  for (const curve_interval_minutes of [1, 15, 60]) {
+    const walk = walkBodyBattery(batteryInputs({
+      heartRate: readings(0, minutes, 10, 50), stress: readings(0, minutes, 10, score),
+      sleeps: [{ start: at(0), end: at(minutes), awake: [[at(0), at(minutes)]] }],
+    }), { ...BB_PARAMS, initial_level: initial, charge_saturation_floor: floor, curve_interval_minutes });
+    near(walk.level, expected);
+    near(walk.contributions.stress.drained, initial - expected);
+    near(walk.contributions.stress.charged, 0);
+    near(walk.contributions.stress.minutes, minutes);
+    near(walk.estimation.minutes, 0);
+  }
 });
 
 test("小睡那段与不在任何会话中逐位一致，按夜睡算则更高", () => {
@@ -1168,7 +1238,7 @@ test("a heart rate reserve above the threshold drains as activity", () => {
 
 test("the battery stays within its bounds", () => {
   // 一段长到 16 小时的睡眠向 charge_saturation_target 渐近：充电项在目标处归零，所以再长也顶不到
-  // 上限。渐近的快慢由 sleep_charge_per_minute 决定（时间常数 85 分钟），十六小时还差 0.25 上下。
+  // 上限。渐近时间常数为 (charge_saturation_target - min_level) / sleep_charge_per_minute。
   const long = walkBodyBattery(batteryInputs({ heartRate: readings(0, 960, 1, 50), stress: readings(0, 960, 10, 15), sleeps: [{ start: at(0), end: at(960), awake: [] }] }), BB_PARAMS);
   assert.ok(long.level < BB_PARAMS.max_level, "阻尼之后不再顶到上限");
   nearWithin(long.level, BB_PARAMS.charge_saturation_target, 0.25);
@@ -1304,8 +1374,7 @@ test("心率和压力在有效期结束的瞬间过期", () => {
     heartRate: [[start, 50]], stress: [[start, 25]],
     sleeps: [{ start, end: hrEnd, awake: [] }],
   }), BB_PARAMS);
-  // 心率有效期那 15 分钟里落着一个曲线点（at(15)），睡眠段被它切成两段，期望按它分段才逐位一致。
-  near(hrWalk.level, chargeFor([[14.75, BB_PARAMS.sleep_charge_per_minute], [0.25, BB_PARAMS.sleep_charge_per_minute]]) - 0.5 * BB_PARAMS.low_intensity_drain_per_minute);
+  near(hrWalk.level, chargeFor([[BB_PARAMS.unworn_after_minutes, BB_PARAMS.sleep_charge_per_minute]]) - 0.5 * BB_PARAMS.low_intensity_drain_per_minute);
   assert.equal(hrWalk.events.find((event) => event.reason === "heart_rate_unavailable").start, start + BB_PARAMS.unworn_after_minutes * 60000);
 
   const stressDuration = BB_PARAMS.stress_hold_minutes + 0.5;
@@ -1314,20 +1383,55 @@ test("心率和压力在有效期结束的瞬间过期", () => {
     heartRate: Array.from({ length: Math.ceil(stressDuration) }, (_, i) => [start + i * 60000, 50]),
     stress: [[start, 25]], sleeps: [{ start, end: stressEnd, awake: [] }],
   }), BB_PARAMS);
-  // 压力过期对睡眠不再有任何影响：整段按阶段速率充，不缺测、不产生 data_gap 事件。曲线网格点
-  // （at(15)、at(30)）落在整分钟心率段内再切一刀，期望的单段积分与之有网格级尾差。
-  nearWithin(stressWalk.level, chargeFor([...minuteSegments(BB_PARAMS.stress_hold_minutes, BB_PARAMS.sleep_charge_per_minute), [0.5, BB_PARAMS.sleep_charge_per_minute]]), 0.001);
+  // 压力过期与曲线切分都不改变睡眠恢复，整段等于一次解析积分。
+  near(stressWalk.level, chargeFor([[stressDuration, BB_PARAMS.sleep_charge_per_minute]]));
   assert.equal(stressWalk.curve.at(-1).estimated, false);
   assert.ok(!stressWalk.events.some((event) => event.type === "data_gap"));
 });
 
-test("活动时缺少压力仍标明估算，追加终点读数不会倒改已积分时段", () => {
-  // 整段都是夜睡里的清醒阶段：走清醒分支，活动耗电遇上压力缺失照旧标估算（睡着的那部分才不再缺测）。
+test("活动仅依赖有效心率，缺少压力不标估算，追加终点读数不倒改历史", () => {
   const input = batteryInputs({ heartRate: readings(0, 5, 1, 100), sleeps: [{ start: at(0), end: at(5), awake: [[at(0), at(5)]] }] });
   const walk = walkBodyBattery(input, BB_PARAMS);
-  assert.equal(walk.curve.at(-1).estimated, true);
+  assert.equal(walk.curve.at(-1).estimated, false);
   const terminalReading = walkBodyBattery({ ...input, stress: [[at(5), 99]] }, BB_PARAMS);
   assert.deepEqual(terminalReading, walk);
+});
+
+test("活动的耗电、缺测时长与事件不随绘图间隔改变", () => {
+  const input = batteryInputs({
+    heartRate: [[at(0), 50], [at(1), 95], [at(11), 95]],
+    stress: [[at(1), 100], [at(5), 100]],
+    sleeps: [{ start: at(0), end: at(1), stages: [] }],
+  });
+  const walks = [1, 15, 60].map((curve_interval_minutes) => walkBodyBattery(input, { ...BB_PARAMS, curve_interval_minutes }));
+  for (const walk of walks) {
+    near(walk.level, chargeFor([[1, BB_PARAMS.sleep_charge_per_minute]]) - 10 * BB_PARAMS.low_intensity_drain_per_minute);
+    near(walk.contributions.activity.minutes, 10);
+    near(walk.contributions.activity.drained, 10 * BB_PARAMS.low_intensity_drain_per_minute);
+    near(walk.estimation.minutes, 0);
+    assert.deepEqual(walk.events, walks[0].events);
+    assert.ok(!walk.events.some((event) => event.type === "high_stress" || event.type === "data_gap"));
+  }
+});
+
+test("运动前和运动中的压力均不能用于运动后恢复，新压力到达才恢复", () => {
+  const input = batteryInputs({
+    heartRate: [[at(0), 50], [at(1), 140], [at(11), 50], [at(21), 50]],
+    stress: [[at(0), 0], [at(5), 0], [at(16), 0]],
+    sleeps: [{ start: at(0), end: at(1), stages: [] }],
+  });
+  const walks = [1, 15, 60].map((curve_interval_minutes) => walkBodyBattery(input, { ...BB_PARAMS, curve_interval_minutes }));
+  for (const walk of walks) {
+    near(walk.contributions.activity.minutes, 10);
+    near(walk.contributions.stress_unavailable.minutes, 5);
+    near(walk.contributions.rest_recovery.minutes, 5);
+    near(walk.estimation.minutes, 5);
+    near(walk.level, walks[0].level);
+    const gap = walk.events.find((event) => event.type === "data_gap");
+    assert.equal(gap.start, at(11));
+    assert.equal(gap.end, at(16));
+    assert.deepEqual(walk.events, walks[0].events);
+  }
 });
 
 test("午夜分摊真实时长，跨日充放电收支守恒", () => {
@@ -1337,7 +1441,7 @@ test("午夜分摊真实时长，跨日充放电收支守恒", () => {
   }), BB_PARAMS);
   assert.deepEqual(walk.days.map((day) => day.date), ["2026-09-01", "2026-09-02"]);
   // 整分钟睡眠都在充电（压力 40 不再左右睡眠恢复）：各记半分钟，第二天的起点是第一天的终点，
-  // 午夜边界是切分点，两半分钟的阻尼倍率各用自己起点的电量。
+  // 午夜边界切开收支归属，两半分钟的解析积分等于整分钟的解析积分。
   const afterFirst = chargeFor([[0.5, BB_PARAMS.sleep_charge_per_minute]]);
   near(walk.days[0].charged, afterFirst - BB_PARAMS.initial_level);
   near(walk.days[1].charged, chargeFor([[0.5, BB_PARAMS.sleep_charge_per_minute], [0.5, BB_PARAMS.sleep_charge_per_minute]]) - afterFirst);
@@ -1487,32 +1591,32 @@ test("覆盖区间采用整日替换，空快照移除旧分段，省略字段�
   assert.throws(() => mergeHealthData(dir, { date, heart_rate_coverage: [range("09:00", "08:00", "missing")] }), /heart_rate_coverage/);
 });
 
-test("压力局部过渡连续，睡眠按阶段速率、清醒与活动分支保持原速率", () => {
+test("压力局部过渡连续，睡眠与清醒恢复按解析积分，活动只按心率耗电", () => {
   const level = (pressure, awake, bpm = 50) => walkBodyBattery(batteryInputs({
     heartRate: readings(0, 1, 1, bpm), stress: [[at(0), pressure]],
     sleeps: [{ start: at(0), end: at(1), awake: awake ? [[at(0), at(1)]] : [] }],
   }), BB_PARAMS).level;
   const threshold = BB_PARAMS.stress_threshold; const width = BB_PARAMS.stress_transition_half_width;
   // 睡眠充电只由阶段和时长驱动，压力分不出现在它的公式里。
-  const sleepRate = BB_PARAMS.sleep_charge_per_minute * saturation(BB_PARAMS.initial_level);
+  const sleepLevel = chargeFor([[1, BB_PARAMS.sleep_charge_per_minute]]);
   for (const awake of [false, true]) {
     for (const bpm of [50, 93, 140]) {
       for (const edge of [threshold - width, threshold, threshold + width]) {
         assert.ok(Math.abs(level(edge - 0.00001, awake, bpm) - level(edge + 0.00001, awake, bpm)) < 0.00001);
       }
       for (const pressure of [0, threshold - width, threshold + width, 60, 100]) {
-        const charge = BB_PARAMS.rest_charge_per_stress_point * (threshold - pressure) * saturation(BB_PARAMS.initial_level);
+        const charge = BB_PARAMS.rest_charge_per_stress_point * Math.max(0, threshold - pressure);
         const stressDrain = pressure >= threshold ? BB_PARAMS.stress_drain_per_stress_point * pressure : 0;
         const reserve = (bpm - 50) / (BB_PARAMS.max_heart_rate - 50);
-        const delta = reserve > BB_PARAMS.activity_reserve_threshold
-          ? -Math.max(BB_PARAMS.low_intensity_drain_per_minute, BB_PARAMS.activity_drain_per_reserve * (reserve - BB_PARAMS.activity_reserve_threshold), awake ? stressDrain : 0)
-          : awake ? (pressure < threshold ? charge : -stressDrain) : sleepRate;
-        near(level(pressure, awake, bpm), BB_PARAMS.initial_level + delta);
+        const expected = reserve > BB_PARAMS.activity_reserve_threshold
+          ? BB_PARAMS.initial_level - Math.max(BB_PARAMS.low_intensity_drain_per_minute, BB_PARAMS.activity_drain_per_reserve * (reserve - BB_PARAMS.activity_reserve_threshold))
+          : awake ? (pressure < threshold ? chargeFor([[1, charge]]) : BB_PARAMS.initial_level - stressDrain) : sleepLevel;
+        near(level(pressure, awake, bpm), expected);
       }
     }
     near(level(threshold, awake), awake
       ? BB_PARAMS.initial_level - 0.5 * BB_PARAMS.stress_drain_per_stress_point * threshold
-      : BB_PARAMS.initial_level + sleepRate);
+      : sleepLevel);
   }
   const missing = batteryInputs({ heartRate: [], stress: [[at(0), threshold]], sleeps: [{ start: at(0), end: at(1), awake: [] }] });
   near(walkBodyBattery(missing, BB_PARAMS).level, BB_PARAMS.initial_level - BB_PARAMS.low_intensity_drain_per_minute);
@@ -1594,12 +1698,10 @@ test("正常十分钟夜间采样的missing分钟不缩短有效期或扩大估�
   ]).flat();
   const without = walkBodyBattery(input, BB_PARAMS);
   const withCoverage = walkBodyBattery({ ...input, heartRateCoverage: coverage }, BB_PARAMS);
-  // 阻尼让速率随电量变，积分因此不再与切分网格无关：覆盖区间带来的额外边界造成网格级尾差，
-  // 尾差随充电速率放大一倍。这个用例要守的是 missing 分钟既不缩短有效期、也不扩大估算，
-  // 所以逐条比事件与估算。
+  // 覆盖区间增加切分点，但不改变解析积分或缺测判定。
   assert.deepEqual(withCoverage.events, without.events);
   near(withCoverage.estimation.minutes, 0);
-  nearWithin(withCoverage.level, without.level, 0.15);
+  near(withCoverage.level, without.level);
 });
 
 test("五秒心率过期后按原始覆盖区分缺测，不复用更早普通点", () => {
