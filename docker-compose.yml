@@ -14,6 +14,8 @@ services:
       - ./training-load.json:/app/training-load.json:ro
       # 夜醒通知的时长阈值与等待时长
       - ./wake-notify.json:/app/wake-notify.json:ro
+      # 起夜后续睡的时间关联规则
+      - ./sleep.json:/app/sleep.json:ro
     # 只绑宿主机回环，公网入口交给 Caddy/Nginx/Tunnel
     ports:
       - "127.0.0.1:${HEALTH_MCP_PORT}:${HEALTH_MCP_PORT}"

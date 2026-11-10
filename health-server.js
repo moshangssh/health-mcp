@@ -182,7 +182,6 @@ function normalizeSleepSession(rawSession) {
     start,
     end,
     duration_min: Math.round(durationSeconds / 60),
-    score: Number(rawSession.score || 0),
     stages,
   };
 }
@@ -206,12 +205,41 @@ function stageMinutesOf(session, keys) {
   return (Array.isArray(session.stages) ? session.stages : []).reduce((total, stage) => keys.includes(sleepStageMetricKey(stage.stage)) ? total + Math.round(Number(stage.duration_seconds || 0) / 60) : total, 0);
 }
 
-// 小睡的两条判据，展示层和身体电量共用这一个：手环明确打了 nap 阶段，或整段没有一刻
+// 原始小睡标签：手环明确打了 nap 阶段，或整段没有一刻
 // 深睡/浅睡/REM、只有清醒。没有阶段信息的会话无从判断，不算小睡——旧版把整夜当一个对象
 // 上传的那条路径不能因此被误判成白天的小睡。
 function isNapSession(session) {
   return stageMinutesOf(session, ["nap_min"]) > 0
     || (stageMinutesOf(session, ["awake_min"]) > 0 && stageMinutesOf(session, ["deep_min", "light_min", "rem_min"]) === 0);
+}
+
+const SLEEP_PARAMS_PATH = path.join(__dirname, "sleep.json");
+const LOCAL_HOUR_FORMAT = new Intl.DateTimeFormat("en-US", { timeZone: TZ, hour: "2-digit", hourCycle: "h23" });
+
+// 读取时关联同一醒来日的相邻睡眠。设备的 nap 标签保留在原始阶段里；关联是时间规则推断，
+// 不改落盘、不填补间隔，也不把只有清醒阶段的会话当成睡着。展示与身体电量共用这一结果。
+function classifySleepSessions(sessions) {
+  const params = JSON.parse(fs.readFileSync(SLEEP_PARAMS_PATH, "utf8"));
+  const classified = [];
+  for (const session of [...sessions].sort((a, b) => Date.parse(a.start) - Date.parse(b.start))) {
+    const sourceNap = isNapSession(session);
+    const previous = classified.at(-1);
+    const gap = previous ? Date.parse(session.start) - Date.parse(previous.session.end) : null;
+    const continues = previous && !previous.nap
+      && (!sourceNap || stageMinutesOf(session, ["nap_min"]) > 0)
+      && gap >= 0 && gap <= params.continuation_max_gap_minutes * MINUTE_MS
+      && formatLocalDate(new Date(previous.session.end)) === formatLocalDate(new Date(session.start))
+      && formatLocalDate(new Date(previous.session.end)) === formatLocalDate(new Date(session.end))
+      && Number(LOCAL_HOUR_FORMAT.format(new Date(session.start))) < params.continuation_before_hour;
+    classified.push({
+      session,
+      sourceNap,
+      nap: sourceNap && !continues,
+      continuationOf: continues ? previous.continuationOf ?? previous.session.start : null,
+      gapMinutes: continues ? Math.round(gap / MINUTE_MS) : null,
+    });
+  }
+  return classified;
 }
 
 function summarizeSleepSessions(sessions, updatedAt) {
@@ -224,23 +252,16 @@ function summarizeSleepSessions(sessions, updatedAt) {
     nap_min: 0,
     start: sessions[0]?.start || "",
     end: sessions[sessions.length - 1]?.end || "",
-    score: 0,
     updatedAt,
   };
-  let scored = 0;
   for (const session of sessions) {
     summary.duration_min += Number(session.duration_min || 0);
-    if (session.score > 0) {
-      summary.score += session.score;
-      scored += 1;
-    }
     for (const stage of session.stages || []) {
       const minutes = Math.round(Number(stage.duration_seconds || 0) / 60);
       const key = sleepStageMetricKey(stage.stage);
       if (key) summary[key] += minutes;
     }
   }
-  summary.score = scored ? Math.round(summary.score / scored) : 0;
   return summary;
 }
 
@@ -252,7 +273,7 @@ function sleepSessionsOverlap(a, b) {
   return a.start < b.end && b.start < a.end;
 }
 
-// 较晚结束或捕获更多睡眠的版本更完整；同一起止、时长的补传则更新阶段和评分。
+// 较晚结束或捕获更多睡眠的版本更完整；同一起止、时长的补传则更新阶段。
 function moreCompleteSleepSession(a, b) {
   if (a.end !== b.end) return a.end > b.end ? a : b;
   if (a.start === b.start && a.duration_min === b.duration_min) return b;
@@ -272,6 +293,7 @@ function mergeSleepSessionsForDate(dataDir, date, incoming, updatedAt) {
   const filePath = recordPath(dataDir, date);
   const record = readRecord(filePath, { date });
   const stored = Array.isArray(record.sleep_sessions) ? record.sleep_sessions : [];
+  for (const session of stored) delete session.score;
   // Rebuild through the same overlap rule so a file written by the old end|duration merge, which
   // could hold one night twice, heals itself the next time any data for its date arrives.
   const sessions = [];
@@ -421,9 +443,8 @@ function mergeSeries(record, key, entries, updatedAt, extraFields = []) {
   record[key].updatedAt = updatedAt;
 }
 
-// Whole-object entries keyed on their timestamp: one sleep report per night, one emotion or sleep
-// apnea reading per slot, one workout per start time. A re-send replaces that slot instead of
-// growing the list.
+// Whole-object entries keyed on their timestamp: one emotion or sleep apnea reading per slot,
+// one workout per start time. A re-send replaces that slot instead of growing the list.
 function mergeDatedList(record, key, entries) {
   if (!Array.isArray(record[key])) record[key] = [];
   for (const entry of entries) {
@@ -439,21 +460,62 @@ function mergeDatedList(record, key, entries) {
   record[key].sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
 }
 
+// 这些生理测量及其基线的 0 是旧上传端传出的未测量占位值。次数、时长、RDI、基线所需天数等
+// 字段里的 0 有实际含义，保留；这里只列字段语义，不引入可调的生理阈值。
+const SLEEP_STATS_POSITIVE_FIELDS = new Set([
+  "min_heart_rate", "max_heart_rate", "avg_heart_rate", "min_heart_rate_baseline", "max_heart_rate_baseline",
+  "min_oxygen_saturation", "max_oxygen_saturation", "avg_oxygen_saturation", "min_oxygen_saturation_baseline", "max_oxygen_saturation_baseline",
+  "min_breath_rate", "max_breath_rate", "avg_breath_rate", "min_breath_rate_baseline", "max_breath_rate_baseline",
+  "avg_hrv", "min_hrv_baseline", "max_hrv_baseline",
+]);
+
+function sameSleepStats(a, b) {
+  // 入睡时刻是手机数据库里报告的标识，醒来时间被修正不应生成第二份报告。缺此字段的旧客户端
+  // 继续按 timestamp 替换；同 timestamp 的入睡时刻更正也保留原本的替换语义。
+  return Date.parse(a.timestamp) === Date.parse(b.timestamp)
+    || Boolean(a.fall_asleep_time && b.fall_asleep_time
+      && Date.parse(a.fall_asleep_time) === Date.parse(b.fall_asleep_time));
+}
+
+function normalizeSleepStats(stored, incoming = []) {
+  let reports = [];
+  // 旧写入端已按报告时间排序；读取依次保留较后项。新上传永远排在历史之后，
+  // 因此醒来时间改早也会替换。只复制到内存，读取历史不改写磁盘。
+  for (const entry of [...stored, ...incoming]) {
+    if (!entry.timestamp) continue;
+    const report = Object.fromEntries(Object.entries(entry).filter(([key, value]) => !(SLEEP_STATS_POSITIVE_FIELDS.has(key) && value === 0)));
+    reports = reports.filter((existing) => !sameSleepStats(existing, report));
+    reports.push(report);
+  }
+  return reports.sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+}
+
 // A later upload is the day's authoritative snapshot: a corrected (smaller) total replaces the
 // stored one, so a bad reading washes out instead of being pinned forever by Math.max.
 function mergeTotal(record, key, incoming, updatedAt) {
   record[key] = { total: incoming, updatedAt };
 }
 
-function latestSeriesValue(record, key) {
-  const samples = record?.[key]?.samples;
-  if (!Array.isArray(samples) || !samples.length) return null;
-  return nullableNumber(samples[samples.length - 1].value);
-}
-
 function latestSleepStats(record) {
-  const stats = record?.sleep_stats;
-  return Array.isArray(stats) && stats.length ? stats[stats.length - 1] : null;
+  const stats = normalizeSleepStats(record?.sleep_stats || []);
+  const sessions = record?.sleep_sessions?.length ? record.sleep_sessions : (record?.sleep ? [record.sleep] : []);
+  const classified = stats.map((report) => {
+    const start = Date.parse(report.fall_asleep_time);
+    const end = Date.parse(report.wakeup_time || report.rising_time || report.timestamp);
+    const session = sessions.find((candidate) => Number.isFinite(start)
+      ? start < Date.parse(candidate.end) && (Date.parse(candidate.start) <= start || Date.parse(candidate.start) < end)
+      : Date.parse(candidate.start) < end && end <= Date.parse(candidate.end));
+    return { report, session };
+  });
+  // 报告仍按设备原始会话选择。续睡关联不把前半夜的评分扩展成整晚评分，也不以续睡的
+  // 空报告覆盖前半夜报告；每份报告自身的起止时刻明确它的范围。
+  const nights = classified.filter(({ session }) => session && !isNapSession(session));
+  if (nights.length) return nights.at(-1).report;
+  // 无法对应会话的旧报告不按时间阈值猜测类型：当天有评分的报告是可识别的夜报；否则保留
+  // 当天最新的未知报告。明确对应午睡的报告只留在明细；绝不从别天或别份报告补上缺失评分。
+  const unknown = classified.filter(({ session }) => !session);
+  return unknown.filter(({ report }) => nullableNumber(report.sleep_score) !== null).at(-1)?.report
+    ?? unknown.at(-1)?.report ?? null;
 }
 
 function mergeHealthData(dataDir, body) {
@@ -462,6 +524,8 @@ function mergeHealthData(dataDir, body) {
   const filePath = recordPath(dataDir, date);
   let current = readRecord(filePath, { date });
   if (!current.date) current.date = date;
+  if (current.sleep) delete current.sleep.score;
+  for (const session of current.sleep_sessions || []) delete session.score;
 
   const type = body.type;
   const data = body.data || {};
@@ -565,7 +629,8 @@ function mergeHealthData(dataDir, body) {
   ]) {
     if (Array.isArray(body[key])) mergeSeries(current, key, body[key], now, extraFields);
   }
-  for (const key of ["sleep_stats", "emotions", "sleep_apnea", "workouts"]) {
+  if (Array.isArray(body.sleep_stats)) current.sleep_stats = normalizeSleepStats(current.sleep_stats || [], body.sleep_stats);
+  for (const key of ["emotions", "sleep_apnea", "workouts"]) {
     if (Array.isArray(body[key])) mergeDatedList(current, key, body[key]);
   }
   if (Array.isArray(body.heart_rate_coverage)) {
@@ -591,7 +656,6 @@ function mergeHealthData(dataDir, body) {
       awake_min: Number(value.awake_min || value.awake || 0),
       start: value.start || value.startTime || "",
       end: value.end || value.endTime || "",
-      score: Number(value.score || 0),
       updatedAt: now,
     };
   }
@@ -614,6 +678,10 @@ function readHealthRecords(dataDir, days, type, now = new Date()) {
     if (!fs.existsSync(filePath)) continue;
     const record = readRecord(filePath, null);
     if (!record) continue;
+    // 历史文件中的旧评分字段也不再输出；读取不改写磁盘。
+    if (record.sleep) delete record.sleep.score;
+    for (const session of record.sleep_sessions || []) delete session.score;
+    if (Array.isArray(record.sleep_stats)) record.sleep_stats = normalizeSleepStats(record.sleep_stats);
     const cycle = cycleContextForDate(cycleConfig, record.date || date);
     if (type && type !== "all") {
       const filtered = { date: record.date || date };
@@ -634,11 +702,16 @@ function nullableNumber(value) {
   return Number.isFinite(Number(value)) ? Number(value) : null;
 }
 
-function latestSample(record) {
-  return (record?.heart_rate?.samples || [])
-    .map((sample) => ({ time: new Date(sample.ts || sample.timestamp || sample.time || ""), value: nullableNumber(sample.bpm ?? sample.value) }))
+function latestSeriesSample(record, key) {
+  return (record?.[key]?.samples || [])
+    .map((sample) => ({ time: new Date(sample.ts || sample.timestamp || sample.time || ""), value: nullableNumber(key === "heart_rate" ? sample.bpm ?? sample.value : sample.value) }))
     .filter((sample) => !Number.isNaN(sample.time.getTime()) && sample.value !== null)
-    .sort((a, b) => a.time - b.time).at(-1)?.value ?? null;
+    .sort((a, b) => a.time - b.time).at(-1) ?? null;
+}
+
+// 值和测量时间始终来自同一样本；上传到达时间由 last_ingest_at 单独表达。
+function readingFields(sample, key) {
+  return { [key]: sample?.value ?? null, [`${key}_at`]: sample?.time.toISOString() ?? null };
 }
 
 function heartRateSummary(record) {
@@ -652,6 +725,10 @@ function heartRateSummary(record) {
 }
 
 function dailySummary(record) {
+  const classified = classifySleepSessions(record.sleep_sessions || []);
+  const continuationMinutes = classified
+    .filter(({ sourceNap, nap }) => sourceNap && !nap)
+    .reduce((sum, { session }) => sum + stageMinutesOf(session, ["nap_min"]), 0);
   return {
     date: record.date,
     steps: nullableNumber(record?.steps?.total),
@@ -672,8 +749,11 @@ function dailySummary(record) {
     sleep: record.sleep ? {
       duration_min: nullableNumber(record.sleep.duration_min), deep_min: nullableNumber(record.sleep.deep_min),
       light_min: nullableNumber(record.sleep.light_min), rem_min: nullableNumber(record.sleep.rem_min),
-      awake_min: nullableNumber(record.sleep.awake_min), nap_min: nullableNumber(record.sleep.nap_min),
-      score: nullableNumber(record.sleep.score),
+      awake_min: nullableNumber(record.sleep.awake_min),
+      nap_min: continuationMinutes > 0
+        ? classified.filter(({ nap }) => nap).reduce((sum, { session }) => sum + stageMinutesOf(session, ["nap_min"]), 0)
+        : nullableNumber(record.sleep.nap_min),
+      ...(continuationMinutes > 0 ? { unclassified_min: continuationMinutes } : {}),
       start: record.sleep.start || null, end: record.sleep.end || null, updated_at: record.sleep.updatedAt || null,
     } : null,
   };
@@ -698,18 +778,24 @@ function formatLocalClock(value) {
 // `hasOwnSessions` 说的是这一天有没有独立存下来的 sleep_sessions。有的话 record.sleep 是它们的
 // 合计（含午睡），无 stages 的 session 无从知道自己的阶段，只能报未知；没有的话 record.sleep 就是
 // 这一夜本身（旧版把整夜当一个对象上传的那条路径），它的阶段值正是这一夜的，直接读。
-function sleepSession(record, session, hasOwnSessions) {
+function sleepSession(record, classification, hasOwnSessions) {
+  const { session, nap: isNap, sourceNap, continuationOf, gapMinutes } = classification;
   const stages = Array.isArray(session.stages) ? session.stages : [];
   const deep = stageMinutesOf(session, ["deep_min"]); const light = stageMinutesOf(session, ["light_min"]); const rem = stageMinutesOf(session, ["rem_min"]); const awake = stageMinutesOf(session, ["awake_min"]);
   const duration = nullableNumber(session.duration_min) ?? 0;
-  // A session the watch tagged as a nap is one, whatever its stage mix looks like. The awake-only
-  // rule stays for sources that carry no nap tag: theirs is inferred from a session spent entirely
-  // awake. A nap reports no deep, light or rem of its own, and the day's totals must not stand in
-  // for them, or the whole night's stages would be read back as this nap's.
-  const isNap = isNapSession(session);
   const toIso = (value) => Number.isNaN(new Date(value || "").getTime()) ? null : new Date(value).toISOString();
   const result = { type: isNap ? "nap" : "sleep", start: formatLocalClock(session.start), end: formatLocalClock(session.end), start_at: toIso(session.start), end_at: toIso(session.end), total_minutes: duration, duration_text: `${Math.floor(duration / 60)}h ${duration % 60}min` };
   if (isNap) return result;
+  if (continuationOf !== null) Object.assign(result, {
+    source_type: sourceNap ? "nap" : "sleep", continuation_of: toIso(continuationOf), unrecorded_gap_minutes: gapMinutes,
+  });
+  if (sourceNap) {
+    result.unclassified_sleep_minutes = stageMinutesOf(session, ["nap_min"]);
+    // nap 只说明睡过，未提供深/浅/REM 分期。混合阶段保留已记录的分钟，不能把未知写成零。
+    if (deep + light + rem === 0) return Object.assign(result, {
+      deep_sleep_minutes: null, light_sleep_minutes: null, rem_sleep_minutes: null, awake_minutes: awake,
+    });
+  }
   // A session that carries stages is summed from them — a zero here is the watch saying it spent no
   // time in that stage tonight, never another session's figure standing in. A session without
   // stages can only be read off the day's own fields when the day holds no separate sessions, so
@@ -726,7 +812,7 @@ function sleepSessions(records) {
     // 有独立 session 时 record.sleep 只是合计；没有时这个 fallback 把 record.sleep 自己当那一夜。
     const hasOwnSessions = Array.isArray(record.sleep_sessions) && record.sleep_sessions.length > 0;
     const sessions = hasOwnSessions ? record.sleep_sessions : (record.sleep?.start || record.sleep?.end ? [record.sleep] : []);
-    return sessions.map((session) => ({ session: sleepSession(record, session, hasOwnSessions), end: new Date(session.end || "").getTime() }));
+    return classifySleepSessions(sessions).map((classification) => ({ session: sleepSession(record, classification, hasOwnSessions), end: new Date(classification.session.end || "").getTime() }));
   }).sort((a, b) => b.end - a.end).map(({ session }) => session);
 }
 
@@ -736,8 +822,8 @@ function sleepSessions(records) {
 // the assistant ask for it under another data type.
 function sleepStatsList(records) {
   return records
-    .flatMap((record) => (Array.isArray(record.sleep_stats) ? record.sleep_stats : []))
-    .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
+    .flatMap((record) => normalizeSleepStats(record.sleep_stats || []))
+    .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
 }
 
 // The aggregates a workout carries, under the names the app writes them: totals, heart rate and the
@@ -881,12 +967,12 @@ function extractBodyBatterySamples(record) {
   }
   // The day's latest resting figure stands for the whole local day (Q29).
   const resting = (record.resting_heart_rate?.samples || []).reduce((latest, sample) => (!latest || Date.parse(sample.ts) > Date.parse(latest.ts) ? sample : latest), null);
-  for (const session of record.sleep_sessions || []) {
+  for (const { session, nap } of classifySleepSessions(record.sleep_sessions || [])) {
     sleeps.push({
       start: Date.parse(session.start),
       end: Date.parse(session.end),
-      // 小睡留在列表里并带上标记，但 walk 不把它当一夜：将来要单独给小睡建模只改这一处判断。
-      nap: isNapSession(session),
+      // 续睡按睡眠处理，各段仍独立，间隔没有睡眠覆盖。
+      nap,
       // 醒来日的本地日期：夜里的静息心率按它取，逐日拉取也按它决定何时读醒来日的文件。
       wakingDate: formatLocalDate(new Date(session.end)),
       // 全部阶段都进 walk：深睡/REM 的充电倍率要看它，积分也要按它的边界切开。认不出的阶段不参与，
@@ -988,6 +1074,8 @@ function bodyBatteryFeed(dataDir, bounds, fromDate) {
 function sleepChargeMultiplier(stageKey, params) {
   if (stageKey === "deep_min") return params.deep_sleep_charge_multiplier;
   if (stageKey === "rem_min") return params.rem_sleep_charge_multiplier;
+  // 续睡的 nap 阶段不具备深/浅/REM 分期，明确使用现有浅睡基准倍率建模。
+  if (stageKey === "nap_min") return params.light_sleep_charge_multiplier;
   return params.light_sleep_charge_multiplier;
 }
 
@@ -1428,11 +1516,15 @@ function readHealthToolResult(dataDir, args = {}) {
   // than repeated per day summary.
   const profile = readProfile(dataDir);
   const withContext = (result) => ({ ...result, ...(profile ? { profile } : {}), ...(todayRecord.cycle ? { cycle: todayRecord.cycle } : {}) });
-  if (dataType === "current_status") return withContext({ ...resultBase, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, heart_rate: latestSample(todayRecord), spo2: latestSeriesValue(todayRecord, "spo2"), stress: latestSeriesValue(todayRecord, "stress"), hrv: latestSeriesValue(todayRecord, "hrv"), temperature: latestSeriesValue(todayRecord, "temperature"), sleep_score: nullableNumber(latestSleepStats(todayRecord)?.sleep_score), sleep_stats: latestSleepStats(todayRecord), latest_sleep: sleep[0] || null });
+  const currentReadings = dataType === "current_status" || dataType === "all"
+    ? Object.assign({}, ...["heart_rate", "spo2", "stress", "hrv", "temperature"].map((key) =>
+      readingFields(latestSeriesSample(todayRecord, key), key === "heart_rate" && dataType === "all" ? "today_heart_rate" : key)))
+    : {};
+  if (dataType === "current_status") return withContext({ ...resultBase, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, ...currentReadings, sleep_score: nullableNumber(latestSleepStats(todayRecord)?.sleep_score), sleep_stats: latestSleepStats(todayRecord), latest_sleep: sleep[0] || null });
   const range = { ...resultBase, time_range: timeRange, days };
   if (dataType === "steps") return withContext({ ...range, today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, summaries: summaries.map(({ date, steps, calories }) => ({ date, steps, calories })) });
   if (dataType === "heart_rate") {
-    const result = withContext({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, daily_summaries: summaries.map(({ date, hr_max, hr_min, hr_avg, hr_resting }) => ({ date, hr_max, hr_min, hr_avg, hr_resting })) });
+    const result = withContext({ ...range, ...readingFields(records.map((record) => latestSeriesSample(record, "heart_rate")).find((sample) => sample !== null), "latest_heart_rate"), daily_summaries: summaries.map(({ date, hr_max, hr_min, hr_avg, hr_resting }) => ({ date, hr_max, hr_min, hr_avg, hr_resting })) });
     return args.heart_rate_detail === "hourly" ? { ...result, detail: "hourly", hourly_summaries: hourlyHeartRateSummaries(records) } : result;
   }
   if (dataType === "sleep") return withContext({ ...range, recent_sleep_list: sleep, recent_sleep_stats_list: sleepStatsList(records) });
@@ -1441,7 +1533,7 @@ function readHealthToolResult(dataDir, args = {}) {
   if (dataType === "series") return withContext({ ...range, series: records.map(seriesForRecord) });
   if (dataType === "body_battery") return withContext({ ...range, body_battery: bodyBattery(dataDir, days) });
   if (dataType === "training_load") return withContext({ ...range, training_load: trainingLoad(dataDir, days, args) });
-  return withContext({ ...range, latest_heart_rate: records.map(latestSample).find((value) => value !== null) ?? null, today_heart_rate: latestSample(todayRecord), spo2: latestSeriesValue(todayRecord, "spo2"), stress: latestSeriesValue(todayRecord, "stress"), hrv: latestSeriesValue(todayRecord, "hrv"), temperature: latestSeriesValue(todayRecord, "temperature"), sleep_score: nullableNumber(latestSleepStats(todayRecord)?.sleep_score), today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, recent_sleep_list: sleep, recent_sleep_stats_list: sleepStatsList(records), recent_workout_list: workoutEntries(records), summaries, body_battery: bodyBattery(dataDir, days), training_load: trainingLoad(dataDir, days, args) });
+  return withContext({ ...range, ...readingFields(records.map((record) => latestSeriesSample(record, "heart_rate")).find((sample) => sample !== null), "latest_heart_rate"), ...currentReadings, sleep_score: nullableNumber(latestSleepStats(todayRecord)?.sleep_score), today_steps: summaries.find((summary) => summary.date === today)?.steps ?? null, today_calories: summaries.find((summary) => summary.date === today)?.calories ?? null, recent_sleep_list: sleep, recent_sleep_stats_list: sleepStatsList(records), recent_workout_list: workoutEntries(records), summaries, body_battery: bodyBattery(dataDir, days), training_load: trainingLoad(dataDir, days, args) });
 }
 
 function buildSummaryText(records) {
@@ -1457,7 +1549,8 @@ function buildSummaryText(records) {
       const minutes = Number(record.sleep.duration_min || 0);
       const duration = minutes ? `${Math.floor(minutes / 60)}h${minutes % 60}m` : "";
       const deep = record.sleep.deep_min ? ` 深睡 ${record.sleep.deep_min}min` : "";
-      parts.push(`睡眠 ${duration}${deep}${record.sleep.score ? ` 评分${record.sleep.score}` : ""}`);
+      const score = nullableNumber(latestSleepStats(record)?.sleep_score);
+      parts.push(`睡眠 ${duration}${deep}${score !== null ? ` 评分${score}` : ""}`);
     }
     if (record.cycle?.period_day) {
       parts.push(`${record.cycle.confirmed ? "" : "预计"}经期第${record.cycle.period_day}天`);

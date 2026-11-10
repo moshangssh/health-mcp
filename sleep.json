@@ -1,0 +1,4 @@
+{
+  "continuation_max_gap_minutes": 90,
+  "continuation_before_hour": 12
+}

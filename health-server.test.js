@@ -20,6 +20,59 @@ function readJson(name) {
   return JSON.parse(fs.readFileSync(path.join(__dirname, name), "utf8"));
 }
 
+test("current readings carry their measurement times even when a later upload has no new readings", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+  const date = "2026-09-06";
+  mergeHealthData(dir, {
+    date,
+    heart_rate: [{ timestamp: `${date}T08:27:00+08:00`, value: 84 }],
+    spo2: [{ timestamp: `${date}T08:10:00+08:00`, value: 98 }],
+    stress: [{ timestamp: `${date}T08:21:00+08:00`, value: 48 }],
+    hrv: [{ timestamp: `${date}T08:20:00+08:00`, value: 46 }],
+  });
+  mergeHealthData(dir, { date, steps: { total: 3709 } });
+  for (const data_type of ["current_status", "all"]) {
+    const result = readHealthToolResult(dir, { data_type, days: 1 });
+    const heartKey = data_type === "current_status" ? "heart_rate" : "today_heart_rate";
+    assert.equal(result[heartKey], 84);
+    assert.equal(result[`${heartKey}_at`], "2026-09-06T00:27:00.000Z");
+    assert.equal(result.spo2_at, "2026-09-06T00:10:00.000Z");
+    assert.equal(result.stress_at, "2026-09-06T00:21:00.000Z");
+    assert.equal(result.hrv_at, "2026-09-06T00:20:00.000Z");
+    assert.equal(result.temperature, null);
+    assert.equal(result.temperature_at, null);
+    assert.equal(result.last_ingest_at, FROZEN_NOW.toISOString());
+  }
+});
+
+test("window heart rate pairs its value and timestamp without presenting yesterday's reading as today's", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+  // Timestamp aliases are supported by the existing heart-rate reader; select the actual latest instant.
+  fs.writeFileSync(path.join(dir, "2026-09-05.json"), JSON.stringify({
+    date: "2026-09-05",
+    heart_rate: { samples: [
+      { timestamp: "2026-09-05T23:20:00+08:00", value: 72 },
+      { time: "2026-09-05T14:00:00Z", bpm: 68 },
+    ] },
+  }));
+  const status = readHealthToolResult(dir, { data_type: "current_status" });
+  assert.equal(status.heart_rate, null);
+  assert.equal(status.heart_rate_at, null);
+  for (const data_type of ["heart_rate", "all"]) {
+    const result = readHealthToolResult(dir, { data_type, days: 2 });
+    assert.equal(result.latest_heart_rate, 72);
+    assert.equal(result.latest_heart_rate_at, "2026-09-05T15:20:00.000Z");
+    if (data_type === "all") {
+      assert.equal(result.today_heart_rate, null);
+      assert.equal(result.today_heart_rate_at, null);
+    }
+  }
+});
+
 // The read path resolves "today" from the wall clock, and these two flows use fixtures pinned to
 // 2026-09-06. Freezing Date there keeps the suite independent of the day it runs on.
 const FROZEN_NOW = new Date("2026-09-06T04:00:00Z");
@@ -165,6 +218,125 @@ test("a session with nothing but awake stages is still inferred as a nap", (t) =
 
   const sessions = readHealthToolResult(dir, { data_type: "sleep", time_range: "today" }).recent_sleep_list;
   assert.equal(sessions[0].type, "nap", "a source that reports no nap tag is inferred from its stages");
+});
+
+function morningSleepSpan(start, end, stage) {
+  const startTime = `2026-09-06T${start}+08:00`, endTime = `2026-09-06T${end}+08:00`;
+  const seconds = (Date.parse(endTime) - Date.parse(startTime)) / 1000;
+  return {
+    session_start_time: startTime, session_end_time: endTime, duration_seconds: seconds,
+    stages: [{ stage, start_time: startTime, end_time: endTime, duration_seconds: seconds }],
+  };
+}
+
+test("morning sleep after a bathroom break continues the night even when tagged nap", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+  const date = "2026-09-06";
+  // Same two spans and nap stage as the user's 2026-11-10 record; the first night's stages
+  // are reduced to light sleep because their mix does not affect continuation classification.
+  const nightReport = { timestamp: `${date}T06:01:00+08:00`, fall_asleep_time: `${date}T02:25:00+08:00`, sleep_score: 63 };
+  const resumedReport = { timestamp: `${date}T09:48:00+08:00`, fall_asleep_time: `${date}T07:11:00+08:00` };
+  mergeHealthData(dir, { date, sleep: [morningSleepSpan("02:25:00", "06:00:01", "light")], sleep_stats: [nightReport] });
+  mergeHealthData(dir, { date, sleep: [morningSleepSpan("07:11:00", "09:47:01", "nap")], sleep_stats: [resumedReport] });
+  const beforeRead = fs.readFileSync(path.join(dir, `${date}.json`), "utf8");
+  const [resumed, night] = readHealthToolResult(dir, { data_type: "sleep", time_range: "today" }).recent_sleep_list;
+  assert.equal(resumed.type, "sleep", "resuming the morning's night must not be treated as an independent nap");
+  assert.equal(resumed.source_type, "nap");
+  assert.equal(resumed.continuation_of, night.start_at);
+  assert.equal(resumed.unrecorded_gap_minutes, 71);
+  assert.equal(resumed.total_minutes + night.total_minutes, 371);
+  assert.equal(resumed.unclassified_sleep_minutes, 156);
+  assert.equal(resumed.deep_sleep_minutes, null, "the device did not report sleep stages for the continuation");
+  assert.equal(resumed.light_sleep_minutes, null);
+  assert.equal(resumed.rem_sleep_minutes, null);
+  assert.equal(resumed.awake_minutes, 0, "the gap is not a measured awake stage");
+  assert.deepEqual(extractBodyBatterySamples(readDay(dir, date)).sleeps.map((item) => item.nap), [false, false]);
+  assert.equal(fs.existsSync(path.join(dir, "wake-events.json")), false, "the gap alone must not manufacture a wake notification");
+  const summary = readHealthToolResult(dir, { data_type: "daily_summary", time_range: "today" }).summaries[0];
+  assert.equal(summary.sleep.duration_min, 371);
+  assert.equal(summary.sleep.nap_min, 0);
+  assert.equal(summary.sleep.unclassified_min, 156);
+  assert.deepEqual(summary.sleep_stats, nightReport, "the original scored report retains its original time scope");
+  const status = readHealthToolResult(dir, { data_type: "current_status" });
+  assert.deepEqual(status.latest_sleep, resumed);
+  assert.deepEqual(status.sleep_stats, nightReport);
+  const raw = readHealthToolResult(dir, { data_type: "series", time_range: "today" }).series[0];
+  assert.equal(raw.sleep_sessions[1].stages[0].stage, "nap");
+  assert.deepEqual(raw.sleep_stats, [nightReport, resumedReport]);
+  assert.equal(fs.readFileSync(path.join(dir, date + ".json"), "utf8"), beforeRead);
+});
+
+test("sleep continuation respects the gap, local clock and evidence of actual sleep", (t) => {
+  freezeClock(t);
+  for (const [label, previousEnd, start, end, stage, expectedType, continued] of [
+    ["at the gap limit", "06:00:00", "07:30:00", "09:00:00", "nap", "sleep", true],
+    ["one second beyond the gap limit", "06:00:00", "07:30:01", "09:00:00", "nap", "nap", false],
+    ["at local noon", "11:00:00", "12:00:00", "13:00:00", "nap", "nap", false],
+    ["before local noon", "11:00:00", "11:59:00", "12:30:00", "nap", "sleep", true],
+    ["awake-only record", "06:00:00", "06:10:00", "06:20:00", "awake", "nap", false],
+    ["staged continuation", "06:00:00", "07:11:00", "09:47:00", "light", "sleep", true],
+  ]) {
+    const dir = tmpDataDir();
+    t.after(() => fs.rmSync(dir, { recursive: true }));
+    mergeHealthData(dir, { date: "2026-09-06", sleep: [
+      morningSleepSpan(start, end, stage), morningSleepSpan("02:25:00", previousEnd, "light"),
+    ] });
+    const [resumed, night] = readHealthToolResult(dir, { data_type: "sleep", time_range: "today" }).recent_sleep_list;
+    assert.equal(resumed.type, expectedType, label);
+    assert.equal(resumed.continuation_of, continued ? night.start_at : undefined, label);
+    assert.equal(extractBodyBatterySamples(readDay(dir, "2026-09-06")).sleeps[1].nap, expectedType === "nap", label);
+  }
+});
+
+test("sleep continuation needs an adjacent night and follows corrections and config on reads", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+  const date = "2026-09-06";
+  const query = () => readHealthToolResult(dir, { data_type: "sleep", time_range: "today" }).recent_sleep_list;
+  const night = morningSleepSpan("02:25:00", "06:00:00", "light");
+  const first = morningSleepSpan("07:11:00", "08:00:00", "nap");
+  const second = morningSleepSpan("08:45:00", "09:47:00", "nap");
+  mergeHealthData(dir, { date, sleep: [second, first] });
+  assert.deepEqual(query().map((item) => item.type), ["nap", "nap"], "two naps do not create a night");
+  mergeHealthData(dir, { date, sleep: [night] });
+  assert.deepEqual(query().map((item) => item.type), ["sleep", "sleep", "sleep"], "late arrival of the main sleep reclassifies existing records");
+  assert.equal(query()[0].continuation_of, query()[2].start_at);
+  assert.equal(query()[1].continuation_of, query()[2].start_at);
+  mergeHealthData(dir, { date, sleep: [morningSleepSpan("07:11:00", "08:00:00", "light")] });
+  assert.equal(query()[1].source_type, "sleep", "a corrected source stage is reflected immediately");
+  assert.equal(query()[1].unclassified_sleep_minutes, undefined);
+  const params = readJson("sleep.json");
+  const readFileSync = fs.readFileSync;
+  const configRead = mock.method(fs, "readFileSync", (file, ...args) => file === path.join(__dirname, "sleep.json")
+    ? JSON.stringify({ ...params, continuation_max_gap_minutes: 30 }) : readFileSync(file, ...args));
+  t.after(() => configRead.mock.restore());
+  assert.equal(query()[0].type, "nap", "a changed root config immediately breaks the 45-minute association");
+  assert.equal(query()[1].continuation_of, undefined);
+});
+
+test("body battery counts morning continuation as sleep and leaves the intervening gap outside sleep", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+  const date = "2026-09-06";
+  const start = Date.parse(`${date}T02:25:00+08:00`);
+  const timestamp = (minute) => new Date(start + minute * 60000).toISOString();
+  mergeHealthData(dir, {
+    date,
+    sleep: [morningSleepSpan("02:25:00", "06:00:00", "light"), morningSleepSpan("07:11:00", "09:47:00", "nap")],
+    heart_rate: Array.from({ length: 443 }, (_, minute) => ({ timestamp: timestamp(minute), value: 50 })),
+    stress: Array.from({ length: 45 }, (_, index) => ({ timestamp: timestamp(index * 10), value: 25 })),
+    resting_heart_rate: [{ timestamp: timestamp(0), value: 50 }],
+  });
+  const battery = readHealthToolResult(dir, { data_type: "body_battery", time_range: "today" }).body_battery;
+  assert.equal(battery.contributions.sleep_recovery.minutes, 371);
+  assert.equal(battery.contributions.rest_recovery.minutes, 71);
+  assert.deepEqual(battery.events.filter((event) => event.type === "sleep").map(({ start, end }) => [start, end]), [
+    ["9/6 02:25", "9/6 06:00"], ["9/6 07:11", "9/6 09:47"],
+  ]);
 });
 
 test("a night reports the time it spent awake, which only its own stages know", (t) => {
@@ -337,6 +509,64 @@ test("the daily summary's sleep keeps when the night landed and its span", (t) =
   assert.deepEqual(empty, [], "a day with no file has no summary at all");
 });
 
+test("sleep scores come only from the watch report across uploads and historical reads", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  const date = "2026-09-02";
+  mergeHealthData(dir, {
+    date,
+    sleep: [{ ...night(7, 8), score: 95 }],
+    sleep_stats: [{ timestamp: `${date}T07:00:00+08:00`, sleep_score: 88 }],
+  });
+  const record = readDay(dir, date);
+  assert.equal(Object.hasOwn(record.sleep, "score"), false);
+  assert.equal(Object.hasOwn(record.sleep_sessions[0], "score"), false);
+  assert.equal(dailySummary(record).sleep_score, 88);
+  assert.match(buildSummaryText([record]), /评分88/);
+
+  const wholeNight = { duration_min: 480, start: night(7, 8).session_start_time, end: night(7, 8).session_end_time, score: 95 };
+  for (const body of [{ sleep: wholeNight }, { type: "sleep", data: wholeNight }]) {
+    const legacyDir = tmpDataDir();
+    mergeHealthData(legacyDir, { date, ...body });
+    const legacy = readDay(legacyDir, date);
+    assert.equal(Object.hasOwn(legacy.sleep, "score"), false);
+    assert.equal(dailySummary(legacy).sleep_score, null);
+    assert.doesNotMatch(buildSummaryText([legacy]), /评分/);
+  }
+
+  // 已有文件仍带旧评分时，各读取路径也只暴露报告评分，磁盘不被读取操作改写。
+  record.sleep.score = 95;
+  record.sleep_sessions[0].score = 95;
+  fs.writeFileSync(path.join(dir, `${date}.json`), JSON.stringify(record));
+  assert.equal(Object.hasOwn(dailySummary(record).sleep, "score"), false);
+  assert.match(buildSummaryText([record]), /评分88/);
+  for (const type of ["all", "sleep"]) {
+    const [raw] = readHealthRecords(dir, 10, type);
+    assert.equal(Object.hasOwn(raw.sleep, "score"), false);
+    assert.equal(Object.hasOwn(raw.sleep_sessions[0], "score"), false);
+  }
+  const [summary] = readHealthToolResult(dir, { data_type: "daily_summary", days: 10 }).summaries;
+  assert.equal(Object.hasOwn(summary.sleep, "score"), false);
+  assert.equal(summary.sleep_score, 88);
+  assert.equal(summary.sleep_stats.sleep_score, 88);
+  const [series] = readHealthToolResult(dir, { data_type: "series", days: 10 }).series;
+  assert.equal(Object.hasOwn(series.sleep_sessions[0], "score"), false);
+  assert.deepEqual(readDay(dir, date), record);
+  for (const body of [
+    { date, steps: { total: 1000 } },
+    { date, sleep: [night(4, 5)] },
+    { date: "2026-09-03", sleep: [night(4, 5)] },
+  ]) {
+    fs.writeFileSync(path.join(dir, `${date}.json`), JSON.stringify(record));
+    mergeHealthData(dir, body);
+    const updated = readDay(dir, date);
+    assert.equal(Object.hasOwn(updated.sleep, "score"), false);
+    assert.equal(Object.hasOwn(updated.sleep_sessions[0], "score"), false);
+    assert.equal(updated.sleep.duration_min, 480);
+    assert.deepEqual(updated.sleep_stats, record.sleep_stats);
+  }
+});
+
 test("a session carries the absolute instant beside the local clock", (t) => {
   freezeClock(t);
   const dir = tmpDataDir();
@@ -378,6 +608,116 @@ test("a sleep read carries the watch's own report for each night", (t) => {
   assert.equal(result.recent_sleep_stats_list[0].bed_time, `${date}T22:40:00+08:00`, "the times a session cannot show come with the read");
   assert.equal(result.recent_sleep_stats_list[1].rising_time, "2026-09-05T07:20:00+08:00");
   assert.deepEqual(result.recent_sleep_list, [], "a day the watch reported on but recorded no session for has none");
+});
+
+test("sleep reports replace the same falling-asleep time even when the wake time is corrected", (t) => {
+  const dir = tmpDataDir();
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+  const date = "2026-09-06";
+  const first = { timestamp: `${date}T08:46:00+08:00`, fall_asleep_time: "2026-09-05T23:00:00+08:00", sleep_score: 85, avg_heart_rate: 62 };
+  const corrected = { timestamp: `${date}T09:11:00+08:00`, fall_asleep_time: "2026-09-05T15:00:00.000Z", sleep_score: 84 };
+  const nap = { timestamp: `${date}T14:00:00+08:00`, fall_asleep_time: `${date}T13:00:00+08:00` };
+  mergeHealthData(dir, { date, sleep_stats: [first, nap] });
+  mergeHealthData(dir, { date, sleep_stats: [corrected] });
+  assert.deepEqual(readDay(dir, date).sleep_stats, [corrected, nap], "the whole newer report replaces the old one, with no stale fields");
+  const shorterCorrection = { ...corrected, timestamp: `${date}T08:30:00+08:00`, sleep_score: 82 };
+  mergeHealthData(dir, { date, sleep_stats: [shorterCorrection] });
+  assert.deepEqual(readDay(dir, date).sleep_stats, [shorterCorrection, nap], "a later upload may correct the wake time backwards too");
+
+  const legacy = { timestamp: `${date}T07:00:00+08:00`, sleep_score: 70 };
+  mergeHealthData(dir, { date, sleep_stats: [legacy] });
+  mergeHealthData(dir, { date, sleep_stats: [{ ...legacy, sleep_score: 73 }] });
+  assert.equal(readDay(dir, date).sleep_stats.filter((entry) => entry.timestamp === legacy.timestamp).length, 1);
+  assert.equal(readDay(dir, date).sleep_stats[0].sleep_score, 73);
+  const upgraded = { timestamp: "2026-09-05T23:00:00.000Z", fall_asleep_time: "2026-09-05T22:00:00+08:00", sleep_score: 74 };
+  mergeHealthData(dir, { date, sleep_stats: [upgraded] });
+  assert.equal(readDay(dir, date).sleep_stats.length, 3, "adding the stable identifier at the same instant replaces the legacy report");
+  assert.deepEqual(readDay(dir, date).sleep_stats[0], upgraded);
+  const correctedStart = { ...upgraded, fall_asleep_time: "2026-09-05T22:05:00+08:00" };
+  mergeHealthData(dir, { date, sleep_stats: [correctedStart] });
+  assert.equal(readDay(dir, date).sleep_stats.length, 3, "correcting only the falling-asleep time keeps the existing timestamp identity");
+  assert.deepEqual(readDay(dir, date).sleep_stats[0], correctedStart);
+});
+
+test("sleep summaries select the night report while keeping the later nap in detail", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+  const date = "2026-09-06";
+  const nightReport = { timestamp: `${date}T07:00:00+08:00`, fall_asleep_time: "2026-09-05T23:12:00+08:00", sleep_score: 75 };
+  const napReport = { timestamp: `${date}T14:00:00+08:00`, fall_asleep_time: `${date}T13:00:00+08:00`, sleep_score: 90 };
+  mergeHealthData(dir, {
+    date,
+    sleep: [
+      { session_start_time: "2026-09-05T23:00:00+08:00", session_end_time: nightReport.timestamp, duration_seconds: 28800, stages: [] },
+      { session_start_time: napReport.fall_asleep_time, session_end_time: napReport.timestamp, duration_seconds: 3600, stages: [
+        { stage: "nap", start_time: napReport.fall_asleep_time, end_time: napReport.timestamp, duration_seconds: 3600 },
+      ] },
+    ],
+    sleep_stats: [nightReport, napReport],
+  });
+  const record = readDay(dir, date);
+  assert.deepEqual(dailySummary(record).sleep_stats, nightReport);
+  assert.match(buildSummaryText([record]), /评分75/);
+  for (const data_type of ["current_status", "all"]) {
+    const result = readHealthToolResult(dir, { data_type, time_range: "today" });
+    assert.equal(result.sleep_score, 75, data_type);
+    if (data_type === "current_status") assert.deepEqual(result.sleep_stats, nightReport);
+  }
+  assert.deepEqual(readHealthToolResult(dir, { data_type: "daily_summary", time_range: "today" }).summaries[0].sleep_stats, nightReport);
+  assert.deepEqual(readHealthToolResult(dir, { data_type: "sleep", time_range: "today" }).recent_sleep_stats_list, [napReport, nightReport]);
+
+  // 老客户端只有报告 timestamp 也能对应会话；清醒阶段构成的小睡沿用同一判据。
+  const legacyRecord = structuredClone(record);
+  legacyRecord.sleep_stats.forEach((report) => delete report.fall_asleep_time);
+  legacyRecord.sleep_sessions[1].stages[0].stage = "awake";
+  assert.equal(dailySummary(legacyRecord).sleep_score, 75);
+  assert.equal(dailySummary({ ...record, sleep_stats: [napReport] }).sleep_stats, null);
+  assert.equal(dailySummary({ date, sleep_stats: [nightReport, { ...napReport, sleep_score: undefined }] }).sleep_score, 75,
+    "report-only historical days retain the scored report when a later report carries no score");
+  const unscoredNight = { ...nightReport };
+  delete unscoredNight.sleep_score;
+  const unscoredNap = { ...napReport };
+  delete unscoredNap.sleep_score;
+  assert.equal(dailySummary({ ...record, sleep_stats: [unscoredNight, napReport] }).sleep_score, null,
+    "a recognized night without a score never borrows the nap's score");
+  assert.deepEqual(dailySummary({ date, sleep_stats: [unscoredNight, unscoredNap] }).sleep_stats, unscoredNap,
+    "unclassified legacy reports retain latest-report semantics");
+  assert.deepEqual(dailySummary({ ...record, sleep_stats: [{ ...unscoredNight, timestamp: unscoredNight.fall_asleep_time }] }).sleep_stats,
+    { ...unscoredNight, timestamp: unscoredNight.fall_asleep_time }, "a report anchored on falling asleep still matches its session");
+});
+
+test("historical sleep report reads collapse versions and omit physiological placeholder zeroes without rewriting data", (t) => {
+  freezeClock(t);
+  const dir = tmpDataDir();
+  t.after(() => fs.rmSync(dir, { recursive: true }));
+  const date = "2026-09-06";
+  const first = { timestamp: `${date}T08:46:00+08:00`, fall_asleep_time: "2026-09-05T23:00:00+08:00", sleep_score: 85 };
+  const corrected = { ...first, timestamp: `${date}T09:11:00+08:00`, sleep_score: 84, avg_heart_rate: 61 };
+  const zeroFields = [
+    "min_heart_rate", "max_heart_rate", "avg_heart_rate", "min_heart_rate_baseline", "max_heart_rate_baseline",
+    "min_oxygen_saturation", "max_oxygen_saturation", "avg_oxygen_saturation", "min_oxygen_saturation_baseline", "max_oxygen_saturation_baseline",
+    "min_breath_rate", "max_breath_rate", "avg_breath_rate", "min_breath_rate_baseline", "max_breath_rate_baseline",
+    "avg_hrv", "min_hrv_baseline", "max_hrv_baseline",
+  ];
+  const nap = {
+    timestamp: `${date}T14:00:00+08:00`, fall_asleep_time: `${date}T13:00:00+08:00`,
+    ...Object.fromEntries(zeroFields.map((key) => [key, 0])),
+    wake_count: 0, turn_over_count: 0, heart_rate_day_to_baseline: 0, oxygen_saturation_day_to_baseline: 0,
+    breath_rate_day_to_baseline: 0, hrv_day_to_baseline: 0, rdi: 0, sleep_latency: 0, snore_freq: 0,
+  };
+  const cleanNap = Object.fromEntries(Object.entries(nap).filter(([key]) => !zeroFields.includes(key)));
+  const raw = JSON.stringify({ date, sleep_stats: [first, corrected, nap] });
+  const file = path.join(dir, `${date}.json`);
+  fs.writeFileSync(file, raw);
+  assert.deepEqual(readHealthRecords(dir, 1, "all")[0].sleep_stats, [corrected, cleanNap]);
+  assert.deepEqual(readHealthRecords(dir, 1, "sleep_stats")[0].sleep_stats, [corrected, cleanNap]);
+  assert.deepEqual(readHealthToolResult(dir, { data_type: "series", time_range: "today" }).series[0].sleep_stats, [corrected, cleanNap]);
+  assert.deepEqual(readHealthToolResult(dir, { data_type: "sleep", time_range: "today" }).recent_sleep_stats_list, [cleanNap, corrected]);
+  assert.equal(readHealthToolResult(dir, { data_type: "current_status" }).sleep_score, 84);
+  assert.equal(fs.readFileSync(file, "utf8"), raw, "normalizing a read never modifies the source file");
+  mergeHealthData(dir, { date, sleep_stats: [nap] });
+  assert.deepEqual(readDay(dir, date).sleep_stats, [corrected, cleanNap], "the same normalization applies to old clients still uploading zeroes");
 });
 
 test("a file left duplicated by the old merge heals on the next upload", () => {
@@ -1467,7 +1807,7 @@ test("曲线上没有任何边界落在午夜时，日期仍由午夜本身切�
   near(walk.level, BB_PARAMS.initial_level + walk.days.reduce((sum, day) => sum + day.charged - day.drained, 0));
 });
 
-test("补传同一睡眠的清醒阶段和评分，与一次完整上传得到相同电量", (t) => {
+test("补传同一睡眠的清醒阶段，与一次完整上传得到相同电量", (t) => {
   freezeClock(t);
   const resentDir = tmpDataDir(); const completeDir = tmpDataDir();
   const start = Date.parse("2026-09-06T01:00:00+08:00");
@@ -1475,7 +1815,7 @@ test("补传同一睡眠的清醒阶段和评分，与一次完整上传得到�
   const sleep = { session_start_time: timestamp(0), session_end_time: timestamp(240), duration_seconds: 14400, stages: [] };
   // 补传的是一夜的清醒阶段，两侧的浅睡阶段要一起给：只剩清醒阶段的会话会被判成小睡，
   // 那一层不在这个用例要测的东西里。
-  const corrected = { ...sleep, score: 90, stages: [
+  const corrected = { ...sleep, stages: [
     { stage: "light", start_time: timestamp(0), end_time: timestamp(60), duration_seconds: 3600 },
     { stage: "awake", start_time: timestamp(60), end_time: timestamp(180), duration_seconds: 7200 },
     { stage: "light", start_time: timestamp(180), end_time: timestamp(240), duration_seconds: 3600 },
@@ -1490,7 +1830,6 @@ test("补传同一睡眠的清醒阶段和评分，与一次完整上传得到�
   mergeHealthData(resentDir, { date: data.date, sleep: [corrected] });
   mergeHealthData(completeDir, { ...data, sleep: [corrected] });
   assert.deepEqual(readDay(resentDir, data.date).sleep_sessions, readDay(completeDir, data.date).sleep_sessions);
-  assert.equal(readDay(resentDir, data.date).sleep_sessions[0].score, 90);
   const query = { data_type: "body_battery", time_range: "today" };
   const resent = readHealthToolResult(resentDir, query).body_battery;
   assert.deepEqual(resent, readHealthToolResult(completeDir, query).body_battery);
